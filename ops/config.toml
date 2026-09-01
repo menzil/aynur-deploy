@@ -1,0 +1,12 @@
+listenAddress = "127.0.0.1:9091"
+databasePath = "/var/lib/aynur-deploy/deployments.sqlite3"
+stateDirectory = "/var/lib/aynur-deploy"
+projectsDirectory = "/etc/aynur-deploy/projects"
+gitCommand = "/usr/bin/git"
+cargoCommand = "/var/lib/aynur-deploy/cargo/bin/cargo"
+aynurCommand = "/usr/local/bin/aynur"
+gitFetchAttempts = 3
+gitFetchRetryDelayMs = 2000
+commandTimeoutSeconds = 1800
+maxWebhookBodyBytes = 65536
+workerPollIntervalMs = 1000

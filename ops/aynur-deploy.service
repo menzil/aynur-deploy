@@ -1,0 +1,39 @@
+[Unit]
+Description=Aynur Tag deployment service
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=deploy
+Group=deploy
+WorkingDirectory=/var/lib/aynur-deploy
+Environment=HOME=/var/lib/aynur-deploy
+Environment=CARGO_HOME=/var/lib/aynur-deploy/cargo
+Environment=RUSTUP_HOME=/var/lib/aynur-deploy/rustup
+ExecStart=/usr/local/bin/aynur-deploy serve --config /etc/aynur-deploy/config.toml
+Restart=on-failure
+RestartSec=5s
+UMask=0077
+
+NoNewPrivileges=true
+PrivateDevices=true
+PrivateTmp=true
+ProtectClock=true
+ProtectControlGroups=true
+ProtectHome=true
+ProtectHostname=true
+ProtectKernelLogs=true
+ProtectKernelModules=true
+ProtectKernelTunables=true
+ProtectSystem=strict
+ReadOnlyPaths=/etc/aynur-deploy
+ReadWritePaths=/var/lib/aynur-deploy
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6
+RestrictNamespaces=true
+RestrictRealtime=true
+LockPersonality=true
+MemoryDenyWriteExecute=true
+
+[Install]
+WantedBy=multi-user.target
