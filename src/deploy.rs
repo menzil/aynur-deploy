@@ -939,12 +939,7 @@ impl Deployer {
     }
 
     fn current_path(&self, project: &Project) -> PathBuf {
-        self.config
-            .global
-            .state_directory
-            .join("projects")
-            .join(&project.project_id)
-            .join("current")
+        project.current_path.clone()
     }
 }
 

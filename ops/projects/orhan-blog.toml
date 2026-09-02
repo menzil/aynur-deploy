@@ -1,4 +1,5 @@
 projectId = "orhan-blog"
+currentPath = "/var/www/blog_public"
 repositoryFullName = "aynurcn/blog_public"
 repositoryUrl = "https://gitee.com/aynurcn/blog_public.git"
 webhookToken = "replace-with-a-unique-webhook-token"

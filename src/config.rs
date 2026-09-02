@@ -30,6 +30,7 @@ pub struct GlobalConfig {
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 struct ProjectConfig {
     project_id: String,
+    current_path: PathBuf,
     repository_full_name: String,
     repository_url: String,
     webhook_token: String,
@@ -88,6 +89,7 @@ impl SecretString {
 #[derive(Clone)]
 pub struct Project {
     pub project_id: String,
+    pub current_path: PathBuf,
     pub repository_full_name: String,
     pub repository_url: String,
     pub webhook_token: SecretString,
@@ -168,17 +170,22 @@ pub fn load_config(path: &Path) -> Result<LoadedConfig, AppError> {
         project_path.extension().and_then(|value| value.to_str()) == Some("toml")
     });
     project_paths.sort();
-    if project_paths.is_empty() {
-        return Err(AppError::Config {
-            path: global.projects_directory.clone(),
-            reason: "projectsDirectory must contain at least one .toml project file".to_owned(),
-        });
-    }
-
-    let mut projects = HashMap::with_capacity(project_paths.len());
+    let mut projects: HashMap<String, Project> = HashMap::with_capacity(project_paths.len());
     for project_path in project_paths {
         let project = load_project(&project_path)?;
         let project_id = project.project_id.clone();
+        if let Some(existing) = projects
+            .values()
+            .find(|existing| existing.current_path == project.current_path)
+        {
+            return Err(AppError::Config {
+                path: project_path,
+                reason: format!(
+                    "currentPath {:?} is already used by project {:?}",
+                    project.current_path, existing.project_id
+                ),
+            });
+        }
         if projects.insert(project_id.clone(), project).is_some() {
             return Err(AppError::Config {
                 path: project_path,
@@ -257,6 +264,7 @@ fn load_project(path: &Path) -> Result<Project, AppError> {
             reason: format!("projectId {:?} is invalid", config.project_id),
         });
     }
+    validate_current_path(path, &config.current_path)?;
     validate_repository_full_name(path, &config.repository_full_name)?;
     if config.repository_url.is_empty() || config.repository_url.chars().any(char::is_control) {
         return Err(AppError::Config {
@@ -292,6 +300,7 @@ fn load_project(path: &Path) -> Result<Project, AppError> {
 
     Ok(Project {
         project_id: config.project_id,
+        current_path: config.current_path,
         repository_full_name: config.repository_full_name,
         repository_url: config.repository_url,
         webhook_token: SecretString(config.webhook_token),
@@ -301,6 +310,35 @@ fn load_project(path: &Path) -> Result<Project, AppError> {
         deployment,
         reload,
     })
+}
+
+fn validate_current_path(path: &Path, value: &Path) -> Result<(), AppError> {
+    validate_absolute_path(path, "currentPath", value)?;
+    if value == Path::new("/")
+        || value
+            .components()
+            .any(|component| matches!(component, Component::CurDir | Component::ParentDir))
+    {
+        return Err(AppError::Config {
+            path: path.to_path_buf(),
+            reason: format!(
+                "currentPath must be a normalized absolute path other than /, got {value:?}"
+            ),
+        });
+    }
+    match fs::symlink_metadata(value) {
+        Ok(metadata) if !metadata.file_type().is_symlink() => Err(AppError::Config {
+            path: path.to_path_buf(),
+            reason: format!("currentPath {value:?} must be absent or a symbolic link"),
+        }),
+        Ok(_) => Ok(()),
+        Err(source) if source.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(source) => Err(file_error(
+            "read symlink metadata",
+            value.to_path_buf(),
+            source,
+        )),
+    }
 }
 
 fn load_health_check(path: &Path, config: HealthCheckConfig) -> Result<HealthCheck, AppError> {

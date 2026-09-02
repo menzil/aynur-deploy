@@ -12,6 +12,18 @@ sudo aynur-deploy init
 sudo aynur-deploy add orhan-blog
 ```
 
+`add` 会把默认发布软链路径写入项目配置：
+
+```text
+<stateDirectory>/projects/<projectId>/current
+```
+
+已有服务器需要保留原来的 Nginx `root` 或进程启动路径时，在 `add` 命令中显式指定：
+
+```bash
+sudo aynur-deploy add orhan-blog --current-path /var/www/blog_public
+```
+
 自定义目录只需指定一次：
 
 ```bash
@@ -23,6 +35,7 @@ aynur-deploy add orhan-blog
 
 ```toml
 projectId = "orhan-blog"
+currentPath = "/var/www/blog_public"
 repositoryFullName = "aynurcn/blog_public"
 repositoryUrl = "https://gitee.com/aynurcn/blog_public.git"
 webhookToken = "由 add 自动生成的随机密码"
@@ -39,6 +52,8 @@ timeoutMs = 5000
 type = "static"
 entryFile = "index.html"
 ```
+
+`currentPath` 是必填的绝对路径。`add` 未指定 `--current-path` 时会写入默认路径；指定后则原样写入项目 TOML。该路径必须不存在或已经是软链，`aynur-deploy` 不会覆盖普通文件和目录。release 仍保存在 `stateDirectory/projects/<projectId>/releases/<commitSha>`，部署时只原子切换 `currentPath` 软链。
 
 `static` 是默认类型，适合 Zola、React/Vite 等已经生成最终静态目录的项目。React 项目应在独立的构建环境或 CI 中完成构建，把 `dist/`（或项目实际产物目录）作为发布内容，再让 `static.entryFile` 指向入口文件；部署服务不执行 Node 构建脚本。
 
@@ -83,6 +98,55 @@ command = ["aynur", "reload", "orhan-api", "--update-env"]
 
 把 `webhookToken` 填入 Gitee 仓库的 Tag Push WebHook Password，URL 指向反向代理后的 `/v1/hooks/gitee/orhan-blog`。Token 不会写入日志；项目 TOML 必须保持 `0600`。
 
+## Nginx 反向代理
+
+一个 `aynur-deploy` 实例只需要一个 Nginx 入口，所有项目共用 `/v1/hooks/gitee/<projectId>`。下面的域名和证书路径是脱敏示例：
+
+```nginx
+# /etc/nginx/conf.d/aynur-deploy.conf
+server {
+    listen 80;
+    listen [::]:80;
+    server_name deploy.example.com;
+
+    return 301 https://$host$request_uri;
+}
+
+server {
+    listen 443 ssl;
+    listen [::]:443 ssl;
+    server_name deploy.example.com;
+
+    ssl_certificate /etc/letsencrypt/live/deploy.example.com/fullchain.pem;
+    ssl_certificate_key /etc/letsencrypt/live/deploy.example.com/privkey.pem;
+
+    # Matches maxWebhookBodyBytes = 65536.
+    client_max_body_size 64k;
+
+    location = /healthz {
+        proxy_pass http://127.0.0.1:9091/healthz;
+        proxy_connect_timeout 2s;
+        proxy_read_timeout 5s;
+        proxy_send_timeout 5s;
+    }
+
+    location ^~ /v1/hooks/gitee/ {
+        proxy_pass http://127.0.0.1:9091;
+        proxy_http_version 1.1;
+
+        proxy_connect_timeout 2s;
+        proxy_read_timeout 10s;
+        proxy_send_timeout 10s;
+    }
+
+    location / {
+        return 404;
+    }
+}
+```
+
+每个 Gitee 项目只需要把 WebHook URL 中的 `<projectId>` 换成项目配置里的 `projectId`，例如 `https://deploy.example.com/v1/hooks/gitee/orhan-blog`。Nginx 默认会转发 `X-Gitee-Token` 和 `X-Gitee-Ping` 请求头，不需要为每个项目增加 `location`。
+
 ## 启动与操作
 
 服务的进程守护由 systemd 或 Aynur 负责，`aynur-deploy` 自身只负责部署。检查配置并运行服务：
@@ -90,6 +154,12 @@ command = ["aynur", "reload", "orhan-api", "--update-env"]
 ```bash
 aynur-deploy check
 aynur-deploy serve
+```
+
+查看当前配置的所有部署项目及其发布路径：
+
+```bash
+aynur-deploy list
 ```
 
 生产环境也可以让 systemd 运行同一个 `serve` 命令：
@@ -114,4 +184,4 @@ aynur-deploy rollback orhan-blog <commitSha>
 aynur-deploy unblock orhan-blog
 ```
 
-默认监听 `127.0.0.1:9091`；生产环境由 Nginx 提供 HTTPS 并转发 WebHook。`GET /healthz` 只检查服务和 SQLite 是否可用。
+默认监听 `127.0.0.1:9091`。`GET /healthz` 只检查服务和 SQLite 是否可用。

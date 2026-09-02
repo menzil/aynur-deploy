@@ -453,17 +453,20 @@ async fn setup() -> TestEnvironment {
     let root = temporary_directory.path();
     let repository = create_repository(root);
     let state_directory = root.join("state");
-    let current_path = state_directory
-        .join("projects")
-        .join(PROJECT_ID)
-        .join("current");
+    let current_path = root.join("published/current");
     let fail_all = Arc::new(AtomicBool::new(false));
     let (health_url, health_server) = start_health_server(HealthState {
         current_path: current_path.clone(),
         fail_all: fail_all.clone(),
     })
     .await;
-    let config_path = write_config(root, &repository.origin, &state_directory, &health_url);
+    let config_path = write_config(
+        root,
+        &repository.origin,
+        &state_directory,
+        &current_path,
+        &health_url,
+    );
     let config = Arc::new(load_config(&config_path).unwrap());
     let database = Database::connect(&config.global.database_path)
         .await
@@ -556,6 +559,7 @@ fn write_config(
     root: &Path,
     repository_url: &Path,
     state_directory: &Path,
+    current_path: &Path,
     health_url: &str,
 ) -> PathBuf {
     let projects_directory = root.join("projects");
@@ -588,6 +592,7 @@ workerPollIntervalMs = 10
         format!(
             r#"
 projectId = "{PROJECT_ID}"
+currentPath = "{}"
 repositoryFullName = "{REPOSITORY_FULL_NAME}"
 repositoryUrl = "{}"
 webhookToken = "{TOKEN}"
@@ -604,6 +609,7 @@ timeoutMs = 1000
 type = "static"
 entryFile = "index.html"
 "#,
+            current_path.display(),
             repository_url.display(),
         ),
     )

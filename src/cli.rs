@@ -39,6 +39,8 @@ enum Command {
     Check,
     #[command(about = "Add a project and generate its WebHook password")]
     Add(AddArgs),
+    #[command(about = "List configured deployment projects")]
+    List,
     #[command(about = "Show deployment status for a project")]
     Status(ProjectArgs),
     #[command(about = "Retry a failed deployment")]
@@ -62,6 +64,8 @@ struct AddArgs {
     project_id: String,
     #[arg(long = "type", value_enum, default_value_t = DeploymentType::Static)]
     deployment_type: DeploymentType,
+    #[arg(long)]
+    current_path: Option<PathBuf>,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, ValueEnum)]
@@ -103,6 +107,22 @@ struct AddOutput {
     ok: bool,
     project_id: String,
     project_config_path: PathBuf,
+    current_path: PathBuf,
+}
+
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct ListProjectsOutput {
+    ok: bool,
+    projects: Vec<ListedProject>,
+}
+
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct ListedProject {
+    project_id: String,
+    repository_full_name: String,
+    current_path: PathBuf,
 }
 
 #[derive(Debug, Serialize)]
@@ -213,7 +233,12 @@ async fn run(cli: Cli) -> Result<(), AppError> {
     match cli.command {
         Command::Init(args) => init_home(args.home.as_deref()),
         Command::Check => check_config(&resolve_config_path()?),
-        Command::Add(args) => add_project(&args.project_id, args.deployment_type),
+        Command::Add(args) => add_project(
+            &args.project_id,
+            args.deployment_type,
+            args.current_path.as_deref(),
+        ),
+        Command::List => list_projects(&resolve_config_path()?),
         Command::Status(args) => status(&resolve_config_path()?, &args.project_id).await,
         Command::Retry(args) => retry(&resolve_config_path()?, &args.deployment_id).await,
         Command::Rollback(args) => {
@@ -270,7 +295,11 @@ fn init_home(requested_home: Option<&Path>) -> Result<(), AppError> {
     })
 }
 
-fn add_project(project_id: &str, deployment_type: DeploymentType) -> Result<(), AppError> {
+fn add_project(
+    project_id: &str,
+    deployment_type: DeploymentType,
+    requested_current_path: Option<&Path>,
+) -> Result<(), AppError> {
     validate_project_id(project_id)?;
     let config_path = resolve_config_path()?;
     let text = fs::read_to_string(&config_path)
@@ -280,18 +309,44 @@ fn add_project(project_id: &str, deployment_type: DeploymentType) -> Result<(), 
             path: config_path,
             reason: source.to_string(),
         })?;
+    let current_path = requested_current_path
+        .map(Path::to_path_buf)
+        .unwrap_or_else(|| {
+            config
+                .state_directory
+                .join("projects")
+                .join(project_id)
+                .join("current")
+        });
+    validate_cli_current_path(&current_path)?;
     let projects_directory = config.projects_directory;
     fs::create_dir_all(&projects_directory)
         .map_err(|source| file_error("create directory", projects_directory.clone(), source))?;
     let project_config_path = projects_directory.join(format!("{project_id}.toml"));
     let token = format!("{}{}", Uuid::now_v7().simple(), Uuid::now_v7().simple());
-    let project_config = format_project_config(project_id, &token, deployment_type);
+    let project_config = format_project_config(project_id, &current_path, &token, deployment_type)?;
     write_new_file(&project_config_path, &project_config, 0o600)?;
     emit_json(&AddOutput {
         ok: true,
         project_id: project_id.to_owned(),
         project_config_path,
+        current_path,
     })
+}
+
+fn list_projects(config_path: &Path) -> Result<(), AppError> {
+    let config = load_config(config_path)?;
+    let mut projects: Vec<ListedProject> = config
+        .projects
+        .values()
+        .map(|project| ListedProject {
+            project_id: project.project_id.clone(),
+            repository_full_name: project.repository_full_name.clone(),
+            current_path: project.current_path.clone(),
+        })
+        .collect();
+    projects.sort_by(|left, right| left.project_id.cmp(&right.project_id));
+    emit_json(&ListProjectsOutput { ok: true, projects })
 }
 
 fn resolve_config_path() -> Result<PathBuf, AppError> {
@@ -367,6 +422,25 @@ fn validate_project_id(project_id: &str) -> Result<(), AppError> {
     Ok(())
 }
 
+fn validate_cli_current_path(current_path: &Path) -> Result<(), AppError> {
+    if !current_path.is_absolute()
+        || current_path == Path::new("/")
+        || current_path.components().any(|component| {
+            matches!(
+                component,
+                std::path::Component::CurDir | std::path::Component::ParentDir
+            )
+        })
+    {
+        return Err(AppError::RequestValidation {
+            reason: format!(
+                "currentPath must be a normalized absolute path other than /, got {current_path:?}"
+            ),
+        });
+    }
+    Ok(())
+}
+
 fn format_global_config(home: &Path) -> String {
     let state_directory = if home == Path::new("/etc/aynur-deploy") {
         Path::new("/var/lib/aynur-deploy").to_path_buf()
@@ -381,7 +455,12 @@ fn format_global_config(home: &Path) -> String {
     )
 }
 
-fn format_project_config(project_id: &str, token: &str, deployment_type: DeploymentType) -> String {
+fn format_project_config(
+    project_id: &str,
+    current_path: &Path,
+    token: &str,
+    deployment_type: DeploymentType,
+) -> Result<String, AppError> {
     let deployment = match deployment_type {
         DeploymentType::Static => {
             "type = \"static\"\nentryFile = \"index.html\"\n".to_owned()
@@ -393,9 +472,24 @@ fn format_project_config(project_id: &str, token: &str, deployment_type: Deploym
             "type = \"rust\"\ncargoManifest = \"Cargo.toml\"\npackage = \"my-service\"\nbinary = \"my-service\"\n\n# Optional fixed-argv command after activation:\n# [reload]\n# command = [\"aynur\", \"reload\", \"my-service\", \"--update-env\"]\n".to_owned()
         }
     };
-    format!(
-        "projectId = \"{project_id}\"\nrepositoryFullName = \"owner/repository\"\nrepositoryUrl = \"https://gitee.com/owner/repository.git\"\nwebhookToken = \"{token}\"\ntagPattern = \"^deploy-[0-9]{{8}}-[0-9]{{6}}$\"\nretainReleases = 3\n\n[healthCheck]\n# Replace this with the deployed project's public URL.\nurl = \"https://example.invalid/\"\nattempts = 5\nintervalMs = 2000\ntimeoutMs = 5000\n\n[deployment]\n{deployment}"
-    )
+    let current_path = current_path
+        .to_str()
+        .ok_or_else(|| AppError::RequestValidation {
+            reason: format!("currentPath {current_path:?} must be valid UTF-8"),
+        })?;
+    if current_path
+        .chars()
+        .any(|character| character == '"' || character == '\\' || character.is_control())
+    {
+        return Err(AppError::RequestValidation {
+            reason: format!(
+                "currentPath {current_path:?} must contain no quotes, backslashes, or control characters"
+            ),
+        });
+    }
+    Ok(format!(
+        "projectId = \"{project_id}\"\ncurrentPath = \"{current_path}\"\nrepositoryFullName = \"owner/repository\"\nrepositoryUrl = \"https://gitee.com/owner/repository.git\"\nwebhookToken = \"{token}\"\ntagPattern = \"^deploy-[0-9]{{8}}-[0-9]{{6}}$\"\nretainReleases = 3\n\n[healthCheck]\n# Replace this with the deployed project's public URL.\nurl = \"https://example.invalid/\"\nattempts = 5\nintervalMs = 2000\ntimeoutMs = 5000\n\n[deployment]\n{deployment}"
+    ))
 }
 
 fn write_new_file(path: &Path, contents: &str, mode: u32) -> Result<(), AppError> {
@@ -590,7 +684,7 @@ fn validate_cli_sha(value: &str) -> Result<(), AppError> {
 fn emit_json<T: Serialize>(value: &T) -> Result<(), AppError> {
     let stdout = io::stdout();
     let mut handle = stdout.lock();
-    serde_json::to_writer(&mut handle, value).map_err(|source| AppError::InvalidState {
+    serde_json::to_writer_pretty(&mut handle, value).map_err(|source| AppError::InvalidState {
         reason: format!("could not serialize CLI JSON output: {source}"),
     })?;
     handle
@@ -615,7 +709,7 @@ fn emit_text_stdout(value: &str) -> Result<(), AppError> {
 fn emit_stderr<T: Serialize>(value: &T) {
     let stderr = io::stderr();
     let mut handle = stderr.lock();
-    if serde_json::to_writer(&mut handle, value).is_ok() {
+    if serde_json::to_writer_pretty(&mut handle, value).is_ok() {
         let _ = handle.write_all(b"\n");
     }
 }
