@@ -4,7 +4,6 @@ stateDirectory = "/var/lib/aynur-deploy"
 projectsDirectory = "/etc/aynur-deploy/projects"
 gitCommand = "/usr/bin/git"
 cargoCommand = "/var/lib/aynur-deploy/cargo/bin/cargo"
-aynurCommand = "/usr/local/bin/aynur"
 gitFetchAttempts = 3
 gitFetchRetryDelayMs = 2000
 commandTimeoutSeconds = 1800

@@ -1,4 +1,5 @@
 use std::collections::HashMap;
+use std::ffi::OsString;
 use std::fs;
 use std::net::SocketAddr;
 use std::os::unix::fs::PermissionsExt;
@@ -18,7 +19,6 @@ pub struct GlobalConfig {
     pub projects_directory: PathBuf,
     pub git_command: PathBuf,
     pub cargo_command: PathBuf,
-    pub aynur_command: PathBuf,
     pub git_fetch_attempts: u32,
     pub git_fetch_retry_delay_ms: u64,
     pub command_timeout_seconds: u64,
@@ -37,6 +37,7 @@ struct ProjectConfig {
     retain_releases: usize,
     health_check: HealthCheckConfig,
     deployment: DeploymentConfig,
+    reload: Option<ReloadConfig>,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -59,14 +60,20 @@ enum DeploymentConfig {
     Static {
         entry_file: PathBuf,
     },
-    RustAynur {
+    Binary {
+        binary_path: PathBuf,
+    },
+    Rust {
         cargo_manifest: PathBuf,
         package: String,
         binary: String,
-        aynur_app: String,
-        aynur_home: PathBuf,
-        environment_file: PathBuf,
     },
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct ReloadConfig {
+    command: Vec<String>,
 }
 
 #[derive(Clone)]
@@ -88,6 +95,7 @@ pub struct Project {
     pub retain_releases: usize,
     pub health_check: HealthCheck,
     pub deployment: DeploymentTarget,
+    pub reload: Option<ReloadCommand>,
 }
 
 #[derive(Debug, Clone)]
@@ -103,14 +111,20 @@ pub enum DeploymentTarget {
     Static {
         entry_file: PathBuf,
     },
-    RustAynur {
+    Binary {
+        binary_path: PathBuf,
+    },
+    Rust {
         cargo_manifest: PathBuf,
         package: String,
         binary: String,
-        aynur_app: String,
-        aynur_home: PathBuf,
-        environment_file: PathBuf,
     },
+}
+
+#[derive(Debug, Clone)]
+pub struct ReloadCommand {
+    pub program: PathBuf,
+    pub args: Vec<OsString>,
 }
 
 #[derive(Clone)]
@@ -175,12 +189,10 @@ pub fn load_config(path: &Path) -> Result<LoadedConfig, AppError> {
 
     if projects
         .values()
-        .any(|project| matches!(project.deployment, DeploymentTarget::RustAynur { .. }))
+        .any(|project| matches!(project.deployment, DeploymentTarget::Rust { .. }))
     {
         validate_executable(path, "cargoCommand", &global.cargo_command)?;
-        validate_executable(path, "aynurCommand", &global.aynur_command)?;
     }
-
     Ok(LoadedConfig { global, projects })
 }
 
@@ -199,7 +211,6 @@ fn validate_global(path: &Path, config: &GlobalConfig) -> Result<(), AppError> {
     validate_absolute_path(path, "projectsDirectory", &config.projects_directory)?;
     validate_executable(path, "gitCommand", &config.git_command)?;
     validate_absolute_path(path, "cargoCommand", &config.cargo_command)?;
-    validate_absolute_path(path, "aynurCommand", &config.aynur_command)?;
     validate_positive(
         path,
         "gitFetchAttempts",
@@ -277,6 +288,7 @@ fn load_project(path: &Path) -> Result<Project, AppError> {
     }
     let health_check = load_health_check(path, config.health_check)?;
     let deployment = load_deployment(path, config.deployment)?;
+    let reload = load_reload(path, config.reload)?;
 
     Ok(Project {
         project_id: config.project_id,
@@ -287,6 +299,7 @@ fn load_project(path: &Path) -> Result<Project, AppError> {
         retain_releases: config.retain_releases,
         health_check,
         deployment,
+        reload,
     })
 }
 
@@ -321,31 +334,56 @@ fn load_deployment(path: &Path, config: DeploymentConfig) -> Result<DeploymentTa
             validate_relative_path(path, "deployment.entryFile", &entry_file)?;
             Ok(DeploymentTarget::Static { entry_file })
         }
-        DeploymentConfig::RustAynur {
+        DeploymentConfig::Binary { binary_path } => {
+            validate_relative_path(path, "deployment.binaryPath", &binary_path)?;
+            Ok(DeploymentTarget::Binary { binary_path })
+        }
+        DeploymentConfig::Rust {
             cargo_manifest,
             package,
             binary,
-            aynur_app,
-            aynur_home,
-            environment_file,
         } => {
             validate_relative_path(path, "deployment.cargoManifest", &cargo_manifest)?;
             validate_name(path, "deployment.package", &package)?;
             validate_name(path, "deployment.binary", &binary)?;
-            validate_name(path, "deployment.aynurApp", &aynur_app)?;
-            validate_absolute_path(path, "deployment.aynurHome", &aynur_home)?;
-            validate_absolute_path(path, "deployment.environmentFile", &environment_file)?;
-            validate_private_file(path, "deployment.environmentFile", &environment_file)?;
-            Ok(DeploymentTarget::RustAynur {
+            Ok(DeploymentTarget::Rust {
                 cargo_manifest,
                 package,
                 binary,
-                aynur_app,
-                aynur_home,
-                environment_file,
             })
         }
     }
+}
+
+fn load_reload(
+    path: &Path,
+    config: Option<ReloadConfig>,
+) -> Result<Option<ReloadCommand>, AppError> {
+    config
+        .map(|config| {
+            if config.command.is_empty() {
+                return Err(AppError::Config {
+                    path: path.to_path_buf(),
+                    reason: "reload.command must contain at least one argument".to_owned(),
+                });
+            }
+            if config
+                .command
+                .iter()
+                .any(|value| value.is_empty() || value.chars().any(char::is_control))
+            {
+                return Err(AppError::Config {
+                    path: path.to_path_buf(),
+                    reason: "reload.command arguments must be non-empty and contain no control characters"
+                        .to_owned(),
+                });
+            }
+            let mut command = config.command.into_iter();
+            let program = PathBuf::from(command.next().expect("command is non-empty"));
+            let args = command.map(OsString::from).collect();
+            Ok(ReloadCommand { program, args })
+        })
+        .transpose()
 }
 
 fn validate_repository_full_name(path: &Path, value: &str) -> Result<(), AppError> {
@@ -449,7 +487,9 @@ fn validate_positive(path: &Path, field: &str, value: u64) -> Result<(), AppErro
 
 #[cfg(test)]
 mod tests {
-    use super::DeploymentConfig;
+    use std::path::Path;
+
+    use super::{DeploymentConfig, DeploymentTarget, load_deployment};
 
     #[test]
     fn deployment_rejects_unknown_fields() {
@@ -464,5 +504,34 @@ binary = "unexpected"
             result.is_err(),
             "unknown deployment fields must be rejected"
         );
+    }
+
+    #[test]
+    fn deployment_types_keep_binary_and_rust_fields_distinct() {
+        let binary = toml::from_str::<DeploymentConfig>(
+            r#"
+type = "binary"
+binaryPath = "bin/service"
+"#,
+        )
+        .expect("binary deployment must parse");
+        assert!(matches!(
+            load_deployment(Path::new("project.toml"), binary),
+            Ok(DeploymentTarget::Binary { .. })
+        ));
+
+        let rust = toml::from_str::<DeploymentConfig>(
+            r#"
+type = "rust"
+cargoManifest = "Cargo.toml"
+package = "service"
+binary = "service"
+"#,
+        )
+        .expect("rust deployment must parse");
+        assert!(matches!(
+            load_deployment(Path::new("project.toml"), rust),
+            Ok(DeploymentTarget::Rust { .. })
+        ));
     }
 }

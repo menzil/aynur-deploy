@@ -29,15 +29,17 @@ fn version_uses_plain_text() {
 #[test]
 fn init_creates_private_project_config_with_generated_token() {
     let directory = tempdir().expect("temporary home must be created");
+    let xdg_config_home = directory.path().join("xdg");
     let output = Command::new(env!("CARGO_BIN_EXE_aynur-deploy"))
         .args(["init", "--home"])
         .arg(directory.path())
+        .env("XDG_CONFIG_HOME", &xdg_config_home)
         .output()
         .expect("init command must start");
     assert!(output.status.success(), "stderr={:?}", output.stderr);
     let add = Command::new(env!("CARGO_BIN_EXE_aynur-deploy"))
-        .args(["add", "orhan-blog", "--home"])
-        .arg(directory.path())
+        .args(["add", "orhan-blog"])
+        .env("XDG_CONFIG_HOME", &xdg_config_home)
         .output()
         .expect("add command must start");
     assert!(add.status.success(), "stderr={:?}", add.stderr);
@@ -49,10 +51,59 @@ fn init_creates_private_project_config_with_generated_token() {
         0o600
     );
 
-    let check = Command::new(env!("CARGO_BIN_EXE_aynur-deploy"))
-        .args(["check", "--home"])
+    let repeated = Command::new(env!("CARGO_BIN_EXE_aynur-deploy"))
+        .args(["init", "--home"])
         .arg(directory.path())
+        .env("XDG_CONFIG_HOME", &xdg_config_home)
+        .output()
+        .expect("repeated init command must start");
+    assert!(repeated.status.success(), "stderr={:?}", repeated.stderr);
+    assert!(String::from_utf8_lossy(&repeated.stdout).contains("\"alreadyInitialized\":true"));
+
+    let latest_home = directory.path().join("latest");
+    let latest_init = Command::new(env!("CARGO_BIN_EXE_aynur-deploy"))
+        .args(["init", "--home"])
+        .arg(&latest_home)
+        .env("XDG_CONFIG_HOME", &xdg_config_home)
+        .output()
+        .expect("latest init command must start");
+    assert!(
+        latest_init.status.success(),
+        "stderr={:?}",
+        latest_init.stderr
+    );
+    let latest_add = Command::new(env!("CARGO_BIN_EXE_aynur-deploy"))
+        .args(["add", "latest-project"])
+        .env("XDG_CONFIG_HOME", &xdg_config_home)
+        .output()
+        .expect("latest add command must start");
+    assert!(
+        latest_add.status.success(),
+        "stderr={:?}",
+        latest_add.stderr
+    );
+    assert!(latest_home.join("projects/latest-project.toml").is_file());
+
+    let check = Command::new(env!("CARGO_BIN_EXE_aynur-deploy"))
+        .args(["check"])
+        .env("XDG_CONFIG_HOME", &xdg_config_home)
         .output()
         .expect("check command must start");
     assert!(check.status.success(), "stderr={:?}", check.stderr);
+
+    for (project_id, deployment_type, expected) in [
+        ("test-binary", "binary", "binaryPath = \"bin/my-service\""),
+        ("test-rust", "rust", "cargoManifest = \"Cargo.toml\""),
+    ] {
+        let add = Command::new(env!("CARGO_BIN_EXE_aynur-deploy"))
+            .args(["add", project_id, "--type", deployment_type])
+            .env("XDG_CONFIG_HOME", &xdg_config_home)
+            .output()
+            .expect("add command must start");
+        assert!(add.status.success(), "stderr={:?}", add.stderr);
+        let text = fs::read_to_string(latest_home.join(format!("projects/{project_id}.toml")))
+            .expect("typed project config must exist");
+        assert!(text.contains(expected));
+        assert!(text.contains("# [reload]"));
+    }
 }

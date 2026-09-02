@@ -2,6 +2,8 @@
 name = "aynur-deploy"
 version = "0.1.0"
 edition = "2024"
+description = "Strict Gitee Tag deployment service"
+repository = "https://github.com/menzil/aynur-deploy"
 
 [dependencies]
 axum = "0.8.9"

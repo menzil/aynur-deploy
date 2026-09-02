@@ -1,3 +1,4 @@
+use std::env;
 use std::fs::{self, OpenOptions};
 use std::future::IntoFuture;
 use std::io::{self, Write};
@@ -7,7 +8,7 @@ use std::process::ExitCode;
 use std::sync::Arc;
 
 use clap::error::ErrorKind;
-use clap::{Args, Parser, Subcommand};
+use clap::{Args, Parser, Subcommand, ValueEnum};
 use serde::Serialize;
 use tokio::sync::{Notify, watch};
 use uuid::Uuid;
@@ -26,8 +27,6 @@ use crate::web::{AppState, router};
     about = "Strict Gitee Tag deployment service"
 )]
 struct Cli {
-    #[arg(long, global = true, default_value = "/etc/aynur-deploy")]
-    home: PathBuf,
     #[command(subcommand)]
     command: Command,
 }
@@ -35,7 +34,7 @@ struct Cli {
 #[derive(Debug, Subcommand)]
 enum Command {
     #[command(about = "Initialize the service configuration directory")]
-    Init,
+    Init(InitArgs),
     #[command(about = "Check global and project configuration")]
     Check,
     #[command(about = "Add a project and generate its WebHook password")]
@@ -53,8 +52,23 @@ enum Command {
 }
 
 #[derive(Debug, Args)]
+struct InitArgs {
+    #[arg(long)]
+    home: Option<PathBuf>,
+}
+
+#[derive(Debug, Args)]
 struct AddArgs {
     project_id: String,
+    #[arg(long = "type", value_enum, default_value_t = DeploymentType::Static)]
+    deployment_type: DeploymentType,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq, ValueEnum)]
+enum DeploymentType {
+    Static,
+    Binary,
+    Rust,
 }
 
 #[derive(Debug, Args)]
@@ -79,6 +93,8 @@ struct InitOutput {
     ok: bool,
     config_path: PathBuf,
     projects_directory: PathBuf,
+    already_initialized: bool,
+    message: Option<&'static str>,
 }
 
 #[derive(Debug, Serialize)]
@@ -194,21 +210,35 @@ pub async fn main_entry() -> ExitCode {
 }
 
 async fn run(cli: Cli) -> Result<(), AppError> {
-    let config_path = cli.home.join("config.toml");
     match cli.command {
-        Command::Init => init_home(&cli.home),
-        Command::Check => check_config(&config_path),
-        Command::Add(args) => add_project(&cli.home, &args.project_id),
-        Command::Status(args) => status(&config_path, &args.project_id).await,
-        Command::Retry(args) => retry(&config_path, &args.deployment_id).await,
-        Command::Rollback(args) => rollback(&config_path, &args.project_id, &args.commit_sha).await,
-        Command::Unblock(args) => unblock(&config_path, &args.project_id).await,
-        Command::Serve => serve(&config_path).await,
+        Command::Init(args) => init_home(args.home.as_deref()),
+        Command::Check => check_config(&resolve_config_path()?),
+        Command::Add(args) => add_project(&args.project_id, args.deployment_type),
+        Command::Status(args) => status(&resolve_config_path()?, &args.project_id).await,
+        Command::Retry(args) => retry(&resolve_config_path()?, &args.deployment_id).await,
+        Command::Rollback(args) => {
+            rollback(&resolve_config_path()?, &args.project_id, &args.commit_sha).await
+        }
+        Command::Unblock(args) => unblock(&resolve_config_path()?, &args.project_id).await,
+        Command::Serve => serve(&resolve_config_path()?).await,
     }
 }
 
-fn init_home(home: &Path) -> Result<(), AppError> {
+fn init_home(requested_home: Option<&Path>) -> Result<(), AppError> {
+    let home = match requested_home {
+        Some(value) => value.to_path_buf(),
+        None => match find_config_path()? {
+            Some(config_path) => config_path
+                .parent()
+                .ok_or_else(|| AppError::InvalidState {
+                    reason: format!("configuration path {config_path:?} has no parent"),
+                })?
+                .to_path_buf(),
+            None => PathBuf::from("/etc/aynur-deploy"),
+        },
+    };
     let config_path = home.join("config.toml");
+    let already_initialized = config_path.exists();
     let projects_directory = if config_path.exists() {
         let text = fs::read_to_string(&config_path)
             .map_err(|source| file_error("read", config_path.clone(), source))?;
@@ -224,25 +254,25 @@ fn init_home(home: &Path) -> Result<(), AppError> {
     fs::create_dir_all(&projects_directory)
         .map_err(|source| file_error("create directory", projects_directory.clone(), source))?;
     if !config_path.exists() {
-        let config = format_global_config(home);
+        let config = format_global_config(&home);
         write_new_file(&config_path, &config, 0o600)?;
+    }
+    if requested_home.is_some() {
+        remember_home(&home)?;
     }
     emit_json(&InitOutput {
         ok: true,
         config_path,
         projects_directory,
+        already_initialized,
+        message: already_initialized
+            .then_some("configuration already initialized; existing configuration was kept"),
     })
 }
 
-fn add_project(home: &Path, project_id: &str) -> Result<(), AppError> {
+fn add_project(project_id: &str, deployment_type: DeploymentType) -> Result<(), AppError> {
     validate_project_id(project_id)?;
-    let config_path = home.join("config.toml");
-    if !config_path.exists() {
-        return Err(AppError::Config {
-            path: config_path,
-            reason: "configuration is not initialized; run `aynur-deploy init` first".to_owned(),
-        });
-    }
+    let config_path = resolve_config_path()?;
     let text = fs::read_to_string(&config_path)
         .map_err(|source| file_error("read", config_path.clone(), source))?;
     let config: crate::config::GlobalConfig =
@@ -255,13 +285,72 @@ fn add_project(home: &Path, project_id: &str) -> Result<(), AppError> {
         .map_err(|source| file_error("create directory", projects_directory.clone(), source))?;
     let project_config_path = projects_directory.join(format!("{project_id}.toml"));
     let token = format!("{}{}", Uuid::now_v7().simple(), Uuid::now_v7().simple());
-    let project_config = format_project_config(project_id, &token);
+    let project_config = format_project_config(project_id, &token, deployment_type);
     write_new_file(&project_config_path, &project_config, 0o600)?;
     emit_json(&AddOutput {
         ok: true,
         project_id: project_id.to_owned(),
         project_config_path,
     })
+}
+
+fn resolve_config_path() -> Result<PathBuf, AppError> {
+    find_config_path()?.ok_or_else(|| AppError::Config {
+        path: PathBuf::from("/etc/aynur-deploy/config.toml"),
+        reason: "configuration is not initialized; run `aynur-deploy init` first".to_owned(),
+    })
+}
+
+fn find_config_path() -> Result<Option<PathBuf>, AppError> {
+    let default_config = Path::new("/etc/aynur-deploy/config.toml");
+    let config_home = user_config_home()?;
+    let pointer = config_home.join("active-home");
+    if pointer.exists() {
+        let home = fs::read_to_string(&pointer)
+            .map_err(|source| file_error("read", pointer.clone(), source))?;
+        let home = PathBuf::from(home.trim());
+        let config = home.join("config.toml");
+        if config.exists() {
+            return Ok(Some(config));
+        }
+        return Err(AppError::Config {
+            path: pointer,
+            reason: format!("active home {home:?} does not contain config.toml"),
+        });
+    }
+    let user_config = config_home.join("config.toml");
+    if user_config.exists() {
+        return Ok(Some(user_config));
+    }
+    if default_config.exists() {
+        return Ok(Some(default_config.to_path_buf()));
+    }
+    Ok(None)
+}
+
+fn user_config_home() -> Result<PathBuf, AppError> {
+    if let Some(value) = env::var_os("XDG_CONFIG_HOME")
+        && !value.is_empty()
+    {
+        return Ok(PathBuf::from(value).join("aynur-deploy"));
+    }
+    let home = env::var_os("HOME").ok_or_else(|| AppError::Config {
+        path: PathBuf::from("$HOME/.config/aynur-deploy"),
+        reason: "HOME is not set; set XDG_CONFIG_HOME or run `aynur-deploy init --home <path>`"
+            .to_owned(),
+    })?;
+    Ok(PathBuf::from(home).join(".config/aynur-deploy"))
+}
+
+fn remember_home(home: &Path) -> Result<(), AppError> {
+    let config_home = user_config_home()?;
+    fs::create_dir_all(&config_home)
+        .map_err(|source| file_error("create directory", config_home.clone(), source))?;
+    let pointer = config_home.join("active-home");
+    fs::write(&pointer, format!("{}\n", home.display()))
+        .map_err(|source| file_error("write", pointer.clone(), source))?;
+    fs::set_permissions(&pointer, fs::Permissions::from_mode(0o600))
+        .map_err(|source| file_error("set permissions", pointer, source))
 }
 
 fn validate_project_id(project_id: &str) -> Result<(), AppError> {
@@ -285,16 +374,27 @@ fn format_global_config(home: &Path) -> String {
         home.join("state")
     };
     format!(
-        "listenAddress = \"127.0.0.1:9091\"\ndatabasePath = \"{}\"\nstateDirectory = \"{}\"\nprojectsDirectory = \"{}\"\ngitCommand = \"/usr/bin/git\"\ncargoCommand = \"/usr/bin/cargo\"\naynurCommand = \"/usr/local/bin/aynur\"\ngitFetchAttempts = 3\ngitFetchRetryDelayMs = 2000\ncommandTimeoutSeconds = 1800\nmaxWebhookBodyBytes = 65536\nworkerPollIntervalMs = 1000\n",
+        "listenAddress = \"127.0.0.1:9091\"\ndatabasePath = \"{}\"\nstateDirectory = \"{}\"\nprojectsDirectory = \"{}\"\ngitCommand = \"/usr/bin/git\"\ncargoCommand = \"/usr/bin/cargo\"\ngitFetchAttempts = 3\ngitFetchRetryDelayMs = 2000\ncommandTimeoutSeconds = 1800\nmaxWebhookBodyBytes = 65536\nworkerPollIntervalMs = 1000\n",
         state_directory.join("deployments.sqlite3").display(),
         state_directory.display(),
         home.join("projects").display(),
     )
 }
 
-fn format_project_config(project_id: &str, token: &str) -> String {
+fn format_project_config(project_id: &str, token: &str, deployment_type: DeploymentType) -> String {
+    let deployment = match deployment_type {
+        DeploymentType::Static => {
+            "type = \"static\"\nentryFile = \"index.html\"\n".to_owned()
+        }
+        DeploymentType::Binary => {
+            "type = \"binary\"\nbinaryPath = \"bin/my-service\"\n\n# Optional fixed-argv command after activation:\n# [reload]\n# command = [\"aynur\", \"reload\", \"my-service\", \"--update-env\"]\n".to_owned()
+        }
+        DeploymentType::Rust => {
+            "type = \"rust\"\ncargoManifest = \"Cargo.toml\"\npackage = \"my-service\"\nbinary = \"my-service\"\n\n# Optional fixed-argv command after activation:\n# [reload]\n# command = [\"aynur\", \"reload\", \"my-service\", \"--update-env\"]\n".to_owned()
+        }
+    };
     format!(
-        "projectId = \"{project_id}\"\nrepositoryFullName = \"owner/repository\"\nrepositoryUrl = \"https://gitee.com/owner/repository.git\"\nwebhookToken = \"{token}\"\ntagPattern = \"^deploy-[0-9]{{8}}-[0-9]{{6}}$\"\nretainReleases = 3\n\n[healthCheck]\nurl = \"http://127.0.0.1:8080/\"\nattempts = 5\nintervalMs = 2000\ntimeoutMs = 5000\n\n[deployment]\ntype = \"static\"\nentryFile = \"index.html\"\n"
+        "projectId = \"{project_id}\"\nrepositoryFullName = \"owner/repository\"\nrepositoryUrl = \"https://gitee.com/owner/repository.git\"\nwebhookToken = \"{token}\"\ntagPattern = \"^deploy-[0-9]{{8}}-[0-9]{{6}}$\"\nretainReleases = 3\n\n[healthCheck]\n# Replace this with the deployed project's public URL.\nurl = \"https://example.invalid/\"\nattempts = 5\nintervalMs = 2000\ntimeoutMs = 5000\n\n[deployment]\n{deployment}"
     )
 }
 

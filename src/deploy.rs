@@ -422,11 +422,13 @@ impl Deployer {
 
         let result = match &project.deployment {
             DeploymentTarget::Static { .. } => copy_static_tree(worktree_path, &temporary_release),
-            DeploymentTarget::RustAynur {
+            DeploymentTarget::Binary { binary_path } => {
+                copy_prebuilt_binary(worktree_path, &temporary_release, binary_path)
+            }
+            DeploymentTarget::Rust {
                 cargo_manifest,
                 package,
                 binary,
-                ..
             } => {
                 self.build_rust_binary(
                     deployment,
@@ -767,21 +769,14 @@ impl Deployer {
         project: &Project,
         deployment: &Deployment,
     ) -> Result<(), AppError> {
-        let DeploymentTarget::RustAynur {
-            aynur_app,
-            aynur_home,
-            environment_file,
-            ..
-        } = &project.deployment
-        else {
+        let Some(reload) = &project.reload else {
             return Ok(());
         };
-        validate_mode_0600(environment_file)?;
         let spec = CommandSpec {
-            program: self.config.global.aynur_command.clone(),
-            args: vec![os("reload"), OsString::from(aynur_app), os("--update-env")],
+            program: reload.program.clone(),
+            args: reload.args.clone(),
             current_directory: None,
-            environment: vec![(os("AYNUR_HOME"), aynur_home.as_os_str().to_owned())],
+            environment: Vec::new(),
         };
         run_command(&spec, self.config.global.command_timeout_seconds).await?;
         info!(
@@ -790,8 +785,8 @@ impl Deployer {
             tag = %deployment.tag,
             commitSha = deployment.commit_sha.as_deref().unwrap_or(&deployment.requested_sha),
             stage = "reload",
-            aynurApp = aynur_app,
-            "Aynur app reloaded"
+            reloadProgram = %reload.program.display(),
+            "reload command completed"
         );
         Ok(())
     }
@@ -985,6 +980,36 @@ pub async fn run_worker(
     }
 }
 
+fn copy_prebuilt_binary(
+    source_root: &Path,
+    destination_root: &Path,
+    binary_path: &Path,
+) -> Result<(), AppError> {
+    let source_path = source_root.join(binary_path);
+    let metadata = fs::symlink_metadata(&source_path)
+        .map_err(|source| file_error("read metadata", source_path.clone(), source))?;
+    if !metadata.file_type().is_file() {
+        return Err(AppError::InvalidState {
+            reason: format!("binary source {source_path:?} is not a regular file"),
+        });
+    }
+    if metadata.permissions().mode() & 0o111 == 0 {
+        return Err(AppError::InvalidState {
+            reason: format!("binary source {source_path:?} is not executable"),
+        });
+    }
+    let destination_path = destination_root.join(binary_path);
+    if let Some(parent) = destination_path.parent() {
+        fs::create_dir_all(parent)
+            .map_err(|source| file_error("create directory", parent.to_path_buf(), source))?;
+    }
+    fs::copy(&source_path, &destination_path)
+        .map_err(|source| file_error("copy", source_path.clone(), source))?;
+    fs::set_permissions(&destination_path, metadata.permissions())
+        .map_err(|source| file_error("set permissions", destination_path, source))?;
+    Ok(())
+}
+
 fn copy_static_tree(source: &Path, destination: &Path) -> Result<(), AppError> {
     for entry_result in WalkDir::new(source)
         .follow_links(false)
@@ -1059,21 +1084,25 @@ fn validate_release(project: &Project, release_path: &Path) -> Result<(), AppErr
     }
     let entry_path = match &project.deployment {
         DeploymentTarget::Static { entry_file } => release_path.join(entry_file),
-        DeploymentTarget::RustAynur { binary, .. } => release_path.join(binary),
+        DeploymentTarget::Binary { binary_path } => release_path.join(binary_path),
+        DeploymentTarget::Rust { binary, .. } => release_path.join(binary),
     };
     if !entry_path.is_file() {
         return Err(AppError::InvalidState {
             reason: format!("release entry {entry_path:?} is not a regular file"),
         });
     }
-    if matches!(project.deployment, DeploymentTarget::RustAynur { .. }) {
+    if matches!(
+        project.deployment,
+        DeploymentTarget::Binary { .. } | DeploymentTarget::Rust { .. }
+    ) {
         let mode = fs::metadata(&entry_path)
             .map_err(|source| file_error("read metadata", entry_path.clone(), source))?
             .permissions()
             .mode();
         if mode & 0o111 == 0 {
             return Err(AppError::InvalidState {
-                reason: format!("Rust release entry {entry_path:?} is not executable"),
+                reason: format!("release entry {entry_path:?} is not executable"),
             });
         }
     }
@@ -1171,20 +1200,6 @@ fn validate_sha(value: &str) -> Result<(), AppError> {
     if value.len() != 40 || !value.bytes().all(|byte| byte.is_ascii_hexdigit()) {
         return Err(AppError::InvalidState {
             reason: format!("Git resolved invalid commit SHA {value:?}"),
-        });
-    }
-    Ok(())
-}
-
-fn validate_mode_0600(path: &Path) -> Result<(), AppError> {
-    let metadata = fs::metadata(path)
-        .map_err(|source| file_error("read metadata", path.to_path_buf(), source))?;
-    let mode = metadata.permissions().mode() & 0o777;
-    if !metadata.is_file() || mode != 0o600 {
-        return Err(AppError::InvalidState {
-            reason: format!(
-                "environment file {path:?} must be a regular file with mode 0600, got {mode:04o}"
-            ),
         });
     }
     Ok(())

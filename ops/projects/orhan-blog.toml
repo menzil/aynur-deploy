@@ -6,7 +6,7 @@ tagPattern = "^deploy-[0-9]{8}-[0-9]{6}$"
 retainReleases = 3
 
 [healthCheck]
-url = "https://orhan.cn/95194bdc694f0283a5e145363cbbcf42.txt"
+url = "https://orhan.cn/"
 attempts = 5
 intervalMs = 2000
 timeoutMs = 5000
