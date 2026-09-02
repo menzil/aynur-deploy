@@ -25,7 +25,7 @@ fn version_uses_plain_text() {
         .output()
         .expect("version command must start");
     assert!(output.status.success());
-    assert_eq!(output.stdout, b"aynur-deploy 0.2.0\n");
+    assert_eq!(output.stdout, b"aynur-deploy 0.3.0\n");
 }
 
 #[test]
@@ -154,6 +154,8 @@ fn init_creates_private_project_config_with_generated_token() {
         }
         let add = command.output().expect("add command must start");
         assert!(add.status.success(), "stderr={:?}", add.stderr);
+        let add_json: Value = serde_json::from_slice(&add.stdout).expect("add output must be JSON");
+        assert_eq!(add_json["bootstrapPath"], Value::Null);
         let text = fs::read_to_string(latest_home.join(format!("projects/{project_id}.toml")))
             .expect("typed project config must exist");
         assert!(text.contains(expected));
@@ -200,4 +202,130 @@ fn init_creates_private_project_config_with_generated_token() {
         String::from_utf8_lossy(&relative.stderr)
             .contains("currentPath must be a normalized absolute path other than /")
     );
+}
+
+#[test]
+fn add_adopts_an_existing_current_path_directory() {
+    let directory = tempdir().expect("temporary home must be created");
+    let xdg_config_home = directory.path().join("xdg");
+    let init = Command::new(env!("CARGO_BIN_EXE_aynur-deploy"))
+        .args(["init", "--home"])
+        .arg(directory.path())
+        .env("XDG_CONFIG_HOME", &xdg_config_home)
+        .output()
+        .expect("init command must start");
+    assert!(init.status.success(), "stderr={:?}", init.stderr);
+
+    let current_path = directory.path().join("published-site");
+    fs::create_dir(&current_path).expect("existing current directory must be created");
+    fs::write(current_path.join("index.html"), "existing site")
+        .expect("existing site must be written");
+
+    let add = Command::new(env!("CARGO_BIN_EXE_aynur-deploy"))
+        .args(["add", "existing-site", "--current-path"])
+        .arg(&current_path)
+        .env("XDG_CONFIG_HOME", &xdg_config_home)
+        .output()
+        .expect("add command must start");
+    assert!(add.status.success(), "stderr={:?}", add.stderr);
+
+    let bootstrap_path = directory.path().join("published-site.before-aynur-deploy");
+    let add_json: Value = serde_json::from_slice(&add.stdout).expect("add output must be JSON");
+    assert_eq!(add_json["bootstrapPath"], bootstrap_path.to_str().unwrap());
+    assert_eq!(
+        fs::read_link(&current_path).expect("current path must be a symbolic link"),
+        bootstrap_path
+    );
+    assert_eq!(
+        fs::read_to_string(current_path.join("index.html"))
+            .expect("existing site must remain readable"),
+        "existing site"
+    );
+
+    let check = Command::new(env!("CARGO_BIN_EXE_aynur-deploy"))
+        .arg("check")
+        .env("XDG_CONFIG_HOME", &xdg_config_home)
+        .output()
+        .expect("check command must start");
+    assert!(check.status.success(), "stderr={:?}", check.stderr);
+
+    let existing_target = directory.path().join("existing-target");
+    let existing_link = directory.path().join("existing-link");
+    fs::create_dir(&existing_target).expect("existing link target must be created");
+    std::os::unix::fs::symlink(&existing_target, &existing_link)
+        .expect("existing current symlink must be created");
+    let add_link = Command::new(env!("CARGO_BIN_EXE_aynur-deploy"))
+        .args(["add", "linked-site", "--current-path"])
+        .arg(&existing_link)
+        .env("XDG_CONFIG_HOME", &xdg_config_home)
+        .output()
+        .expect("add command must start");
+    assert!(add_link.status.success(), "stderr={:?}", add_link.stderr);
+    let add_link_json: Value =
+        serde_json::from_slice(&add_link.stdout).expect("add output must be JSON");
+    assert_eq!(add_link_json["bootstrapPath"], Value::Null);
+    assert_eq!(
+        fs::read_link(&existing_link).expect("existing current symlink must remain readable"),
+        existing_target
+    );
+}
+
+#[test]
+fn add_preserves_an_existing_directory_when_bootstrap_path_exists() {
+    let directory = tempdir().expect("temporary home must be created");
+    let xdg_config_home = directory.path().join("xdg");
+    let init = Command::new(env!("CARGO_BIN_EXE_aynur-deploy"))
+        .args(["init", "--home"])
+        .arg(directory.path())
+        .env("XDG_CONFIG_HOME", &xdg_config_home)
+        .output()
+        .expect("init command must start");
+    assert!(init.status.success(), "stderr={:?}", init.stderr);
+
+    let current_path = directory.path().join("published-site");
+    let bootstrap_path = directory.path().join("published-site.before-aynur-deploy");
+    fs::create_dir(&current_path).expect("existing current directory must be created");
+    fs::write(current_path.join("index.html"), "existing site")
+        .expect("existing site must be written");
+    fs::create_dir(&bootstrap_path).expect("conflicting bootstrap directory must be created");
+
+    let add = Command::new(env!("CARGO_BIN_EXE_aynur-deploy"))
+        .args(["add", "conflicting-site", "--current-path"])
+        .arg(&current_path)
+        .env("XDG_CONFIG_HOME", &xdg_config_home)
+        .output()
+        .expect("add command must start");
+    assert!(!add.status.success());
+    assert!(String::from_utf8_lossy(&add.stderr).contains("bootstrap path"));
+    assert!(current_path.is_dir());
+    assert_eq!(
+        fs::read_to_string(current_path.join("index.html"))
+            .expect("existing site must remain unchanged"),
+        "existing site"
+    );
+    assert!(
+        !directory
+            .path()
+            .join("projects/conflicting-site.toml")
+            .exists()
+    );
+
+    let file_path = directory.path().join("published-file");
+    fs::write(&file_path, "not a directory").expect("existing file must be written");
+    let add_file = Command::new(env!("CARGO_BIN_EXE_aynur-deploy"))
+        .args(["add", "file-site", "--current-path"])
+        .arg(&file_path)
+        .env("XDG_CONFIG_HOME", &xdg_config_home)
+        .output()
+        .expect("add command must start");
+    assert!(!add_file.status.success());
+    assert!(
+        String::from_utf8_lossy(&add_file.stderr)
+            .contains("must be absent, a symbolic link, or an existing directory")
+    );
+    assert_eq!(
+        fs::read_to_string(&file_path).expect("existing file must remain unchanged"),
+        "not a directory"
+    );
+    assert!(!directory.path().join("projects/file-site.toml").exists());
 }

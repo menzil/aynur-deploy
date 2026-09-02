@@ -2,7 +2,7 @@ use std::env;
 use std::fs::{self, OpenOptions};
 use std::future::IntoFuture;
 use std::io::{self, Write};
-use std::os::unix::fs::PermissionsExt;
+use std::os::unix::fs::{PermissionsExt, symlink};
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 use std::sync::Arc;
@@ -108,6 +108,7 @@ struct AddOutput {
     project_id: String,
     project_config_path: PathBuf,
     current_path: PathBuf,
+    bootstrap_path: Option<PathBuf>,
 }
 
 #[derive(Debug, Serialize)]
@@ -326,12 +327,98 @@ fn add_project(
     let token = format!("{}{}", Uuid::now_v7().simple(), Uuid::now_v7().simple());
     let project_config = format_project_config(project_id, &current_path, &token, deployment_type)?;
     write_new_file(&project_config_path, &project_config, 0o600)?;
+    let bootstrap_path = match requested_current_path {
+        Some(_) => match adopt_existing_current_path(&current_path) {
+            Ok(value) => value,
+            Err(source) => {
+                return Err(remove_failed_project_config(&project_config_path, source));
+            }
+        },
+        None => None,
+    };
     emit_json(&AddOutput {
         ok: true,
         project_id: project_id.to_owned(),
         project_config_path,
         current_path,
+        bootstrap_path,
     })
+}
+
+fn adopt_existing_current_path(current_path: &Path) -> Result<Option<PathBuf>, AppError> {
+    let metadata = match fs::symlink_metadata(current_path) {
+        Ok(value) => value,
+        Err(source) if source.kind() == io::ErrorKind::NotFound => return Ok(None),
+        Err(source) => {
+            return Err(file_error(
+                "read symlink metadata",
+                current_path.to_path_buf(),
+                source,
+            ));
+        }
+    };
+    if metadata.file_type().is_symlink() {
+        return Ok(None);
+    }
+    if !metadata.is_dir() {
+        return Err(AppError::RequestValidation {
+            reason: format!(
+                "currentPath {current_path:?} must be absent, a symbolic link, or an existing directory"
+            ),
+        });
+    }
+
+    let bootstrap_path = bootstrap_path_for(current_path)?;
+    match fs::symlink_metadata(&bootstrap_path) {
+        Ok(_) => {
+            return Err(AppError::RequestValidation {
+                reason: format!(
+                    "cannot adopt currentPath {current_path:?}: bootstrap path {bootstrap_path:?} already exists"
+                ),
+            });
+        }
+        Err(source) if source.kind() == io::ErrorKind::NotFound => {}
+        Err(source) => {
+            return Err(file_error("read symlink metadata", bootstrap_path, source));
+        }
+    }
+
+    fs::rename(current_path, &bootstrap_path)
+        .map_err(|source| file_error("rename", current_path.to_path_buf(), source))?;
+    if let Err(source) = symlink(&bootstrap_path, current_path) {
+        let adoption_error = file_error("create symlink", current_path.to_path_buf(), source);
+        return match fs::rename(&bootstrap_path, current_path) {
+            Ok(()) => Err(adoption_error),
+            Err(rollback_error) => Err(AppError::InvalidState {
+                reason: format!(
+                    "failed to adopt currentPath with {adoption_error}; restoring {bootstrap_path:?} to {current_path:?} also failed: {rollback_error}"
+                ),
+            }),
+        };
+    }
+    Ok(Some(bootstrap_path))
+}
+
+fn bootstrap_path_for(current_path: &Path) -> Result<PathBuf, AppError> {
+    let file_name = current_path
+        .file_name()
+        .ok_or_else(|| AppError::RequestValidation {
+            reason: format!("currentPath {current_path:?} has no final path component"),
+        })?;
+    let mut bootstrap_name = file_name.to_os_string();
+    bootstrap_name.push(".before-aynur-deploy");
+    Ok(current_path.with_file_name(bootstrap_name))
+}
+
+fn remove_failed_project_config(project_config_path: &Path, source: AppError) -> AppError {
+    match fs::remove_file(project_config_path) {
+        Ok(()) => source,
+        Err(cleanup_error) => AppError::InvalidState {
+            reason: format!(
+                "project setup failed with {source}; removing generated configuration {project_config_path:?} also failed: {cleanup_error}"
+            ),
+        },
+    }
 }
 
 fn list_projects(config_path: &Path) -> Result<(), AppError> {

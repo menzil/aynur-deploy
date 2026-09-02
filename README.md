@@ -24,6 +24,8 @@ sudo aynur-deploy add orhan-blog
 sudo aynur-deploy add orhan-blog --current-path /var/www/blog_public
 ```
 
+如果 `/var/www/blog_public` 是已有目录，`add` 会把它重命名为同级的 `/var/www/blog_public.before-aynur-deploy`，再在原路径创建指向该目录的绝对软链。原有内容不会复制或删除，命令输出中的 `bootstrapPath` 会记录备份位置。备份路径已存在或 `currentPath` 是普通文件时，命令会在移动内容前明确失败，并删除本次生成的项目配置。
+
 自定义目录只需指定一次：
 
 ```bash
@@ -53,7 +55,7 @@ type = "static"
 entryFile = "index.html"
 ```
 
-`currentPath` 是必填的绝对路径。`add` 未指定 `--current-path` 时会写入默认路径；指定后则原样写入项目 TOML。该路径必须不存在或已经是软链，`aynur-deploy` 不会覆盖普通文件和目录。release 仍保存在 `stateDirectory/projects/<projectId>/releases/<commitSha>`，部署时只原子切换 `currentPath` 软链。
+`currentPath` 是必填的绝对路径。`add` 未指定 `--current-path` 时会写入默认路径；指定后则原样写入项目 TOML，并自动接管该位置已有的目录。配置加载时，该路径必须不存在或已经是软链。release 仍保存在 `stateDirectory/projects/<projectId>/releases/<commitSha>`，部署时只原子切换 `currentPath` 软链。首次部署确认成功前不要删除 `bootstrapPath`，它是首次健康检查失败时的回滚目标。
 
 `static` 是默认类型，适合 Zola、React/Vite 等已经生成最终静态目录的项目。React 项目应在独立的构建环境或 CI 中完成构建，把 `dist/`（或项目实际产物目录）作为发布内容，再让 `static.entryFile` 指向入口文件；部署服务不执行 Node 构建脚本。
 
