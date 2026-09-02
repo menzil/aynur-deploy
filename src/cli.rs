@@ -1,5 +1,7 @@
+use std::fs::{self, OpenOptions};
 use std::future::IntoFuture;
 use std::io::{self, Write};
+use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 use std::sync::Arc;
@@ -8,6 +10,7 @@ use clap::error::ErrorKind;
 use clap::{Args, Parser, Subcommand};
 use serde::Serialize;
 use tokio::sync::{Notify, watch};
+use uuid::Uuid;
 
 use crate::config::{LoadedConfig, load_config};
 use crate::db::Database;
@@ -23,50 +26,67 @@ use crate::web::{AppState, router};
     about = "Strict Gitee Tag deployment service"
 )]
 struct Cli {
+    #[arg(long, global = true, default_value = "/etc/aynur-deploy")]
+    home: PathBuf,
     #[command(subcommand)]
     command: Command,
 }
 
 #[derive(Debug, Subcommand)]
 enum Command {
-    CheckConfig(ConfigOnlyArgs),
+    #[command(about = "Initialize the service configuration directory")]
+    Init,
+    #[command(about = "Check global and project configuration")]
+    Check,
+    #[command(about = "Add a project and generate its WebHook password")]
+    Add(AddArgs),
+    #[command(about = "Show deployment status for a project")]
     Status(ProjectArgs),
+    #[command(about = "Retry a failed deployment")]
     Retry(RetryArgs),
+    #[command(about = "Roll back to a successful release")]
     Rollback(RollbackArgs),
+    #[command(about = "Unlock a blocked project")]
     Unblock(ProjectArgs),
-    Serve(ConfigOnlyArgs),
+    #[command(about = "Start the HTTP deployment service")]
+    Serve,
 }
 
 #[derive(Debug, Args)]
-struct ConfigOnlyArgs {
-    #[arg(long)]
-    config: PathBuf,
+struct AddArgs {
+    project_id: String,
 }
 
 #[derive(Debug, Args)]
 struct ProjectArgs {
-    #[arg(long)]
-    config: PathBuf,
-    #[arg(long)]
     project_id: String,
 }
 
 #[derive(Debug, Args)]
 struct RetryArgs {
-    #[arg(long)]
-    config: PathBuf,
-    #[arg(long)]
     deployment_id: String,
 }
 
 #[derive(Debug, Args)]
 struct RollbackArgs {
-    #[arg(long)]
-    config: PathBuf,
-    #[arg(long)]
     project_id: String,
-    #[arg(long)]
     commit_sha: String,
+}
+
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct InitOutput {
+    ok: bool,
+    config_path: PathBuf,
+    projects_directory: PathBuf,
+}
+
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct AddOutput {
+    ok: bool,
+    project_id: String,
+    project_config_path: PathBuf,
 }
 
 #[derive(Debug, Serialize)]
@@ -121,13 +141,6 @@ struct CliErrorBody {
     message: String,
 }
 
-#[derive(Debug, Serialize)]
-#[serde(rename_all = "camelCase")]
-struct CliHelpOutput {
-    ok: bool,
-    help: String,
-}
-
 pub async fn main_entry() -> ExitCode {
     let cli = match Cli::try_parse() {
         Ok(value) => value,
@@ -137,11 +150,20 @@ pub async fn main_entry() -> ExitCode {
                 ErrorKind::DisplayHelp | ErrorKind::DisplayVersion
             ) =>
         {
-            let output = CliHelpOutput {
-                ok: true,
-                help: source.to_string(),
+            return match emit_text_stdout(&source.to_string()) {
+                Ok(()) => ExitCode::SUCCESS,
+                Err(source) => {
+                    let output = CliErrorOutput {
+                        ok: false,
+                        error: CliErrorBody {
+                            code: source.code().to_owned(),
+                            message: source.to_string(),
+                        },
+                    };
+                    emit_stderr(&output);
+                    ExitCode::FAILURE
+                }
             };
-            return emit_stdout(&output);
         }
         Err(source) => {
             let output = CliErrorOutput {
@@ -172,14 +194,120 @@ pub async fn main_entry() -> ExitCode {
 }
 
 async fn run(cli: Cli) -> Result<(), AppError> {
+    let config_path = cli.home.join("config.toml");
     match cli.command {
-        Command::CheckConfig(args) => check_config(&args.config),
-        Command::Status(args) => status(&args.config, &args.project_id).await,
-        Command::Retry(args) => retry(&args.config, &args.deployment_id).await,
-        Command::Rollback(args) => rollback(&args.config, &args.project_id, &args.commit_sha).await,
-        Command::Unblock(args) => unblock(&args.config, &args.project_id).await,
-        Command::Serve(args) => serve(&args.config).await,
+        Command::Init => init_home(&cli.home),
+        Command::Check => check_config(&config_path),
+        Command::Add(args) => add_project(&cli.home, &args.project_id),
+        Command::Status(args) => status(&config_path, &args.project_id).await,
+        Command::Retry(args) => retry(&config_path, &args.deployment_id).await,
+        Command::Rollback(args) => rollback(&config_path, &args.project_id, &args.commit_sha).await,
+        Command::Unblock(args) => unblock(&config_path, &args.project_id).await,
+        Command::Serve => serve(&config_path).await,
     }
+}
+
+fn init_home(home: &Path) -> Result<(), AppError> {
+    let config_path = home.join("config.toml");
+    let projects_directory = if config_path.exists() {
+        let text = fs::read_to_string(&config_path)
+            .map_err(|source| file_error("read", config_path.clone(), source))?;
+        let config: crate::config::GlobalConfig =
+            toml::from_str(&text).map_err(|source| AppError::Config {
+                path: config_path.clone(),
+                reason: source.to_string(),
+            })?;
+        config.projects_directory
+    } else {
+        home.join("projects")
+    };
+    fs::create_dir_all(&projects_directory)
+        .map_err(|source| file_error("create directory", projects_directory.clone(), source))?;
+    if !config_path.exists() {
+        let config = format_global_config(home);
+        write_new_file(&config_path, &config, 0o600)?;
+    }
+    emit_json(&InitOutput {
+        ok: true,
+        config_path,
+        projects_directory,
+    })
+}
+
+fn add_project(home: &Path, project_id: &str) -> Result<(), AppError> {
+    validate_project_id(project_id)?;
+    let config_path = home.join("config.toml");
+    if !config_path.exists() {
+        return Err(AppError::Config {
+            path: config_path,
+            reason: "configuration is not initialized; run `aynur-deploy init` first".to_owned(),
+        });
+    }
+    let text = fs::read_to_string(&config_path)
+        .map_err(|source| file_error("read", config_path.clone(), source))?;
+    let config: crate::config::GlobalConfig =
+        toml::from_str(&text).map_err(|source| AppError::Config {
+            path: config_path,
+            reason: source.to_string(),
+        })?;
+    let projects_directory = config.projects_directory;
+    fs::create_dir_all(&projects_directory)
+        .map_err(|source| file_error("create directory", projects_directory.clone(), source))?;
+    let project_config_path = projects_directory.join(format!("{project_id}.toml"));
+    let token = format!("{}{}", Uuid::now_v7().simple(), Uuid::now_v7().simple());
+    let project_config = format_project_config(project_id, &token);
+    write_new_file(&project_config_path, &project_config, 0o600)?;
+    emit_json(&AddOutput {
+        ok: true,
+        project_id: project_id.to_owned(),
+        project_config_path,
+    })
+}
+
+fn validate_project_id(project_id: &str) -> Result<(), AppError> {
+    let pattern = regex::Regex::new(r"^[a-z0-9][a-z0-9-]{0,63}$").map_err(|source| {
+        AppError::InvalidState {
+            reason: format!("internal project ID regular expression is invalid: {source}"),
+        }
+    })?;
+    if !pattern.is_match(project_id) {
+        return Err(AppError::RequestValidation {
+            reason: format!("projectId {project_id:?} is invalid"),
+        });
+    }
+    Ok(())
+}
+
+fn format_global_config(home: &Path) -> String {
+    let state_directory = if home == Path::new("/etc/aynur-deploy") {
+        Path::new("/var/lib/aynur-deploy").to_path_buf()
+    } else {
+        home.join("state")
+    };
+    format!(
+        "listenAddress = \"127.0.0.1:9091\"\ndatabasePath = \"{}\"\nstateDirectory = \"{}\"\nprojectsDirectory = \"{}\"\ngitCommand = \"/usr/bin/git\"\ncargoCommand = \"/usr/bin/cargo\"\naynurCommand = \"/usr/local/bin/aynur\"\ngitFetchAttempts = 3\ngitFetchRetryDelayMs = 2000\ncommandTimeoutSeconds = 1800\nmaxWebhookBodyBytes = 65536\nworkerPollIntervalMs = 1000\n",
+        state_directory.join("deployments.sqlite3").display(),
+        state_directory.display(),
+        home.join("projects").display(),
+    )
+}
+
+fn format_project_config(project_id: &str, token: &str) -> String {
+    format!(
+        "projectId = \"{project_id}\"\nrepositoryFullName = \"owner/repository\"\nrepositoryUrl = \"https://gitee.com/owner/repository.git\"\nwebhookToken = \"{token}\"\ntagPattern = \"^deploy-[0-9]{{8}}-[0-9]{{6}}$\"\nretainReleases = 3\n\n[healthCheck]\nurl = \"http://127.0.0.1:8080/\"\nattempts = 5\nintervalMs = 2000\ntimeoutMs = 5000\n\n[deployment]\ntype = \"static\"\nentryFile = \"index.html\"\n"
+    )
+}
+
+fn write_new_file(path: &Path, contents: &str, mode: u32) -> Result<(), AppError> {
+    let mut file = OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(path)
+        .map_err(|source| file_error("create", path.to_path_buf(), source))?;
+    file.write_all(contents.as_bytes())
+        .map_err(|source| file_error("write", path.to_path_buf(), source))?;
+    fs::set_permissions(path, fs::Permissions::from_mode(mode))
+        .map_err(|source| file_error("set permissions", path.to_path_buf(), source))
 }
 
 fn check_config(config_path: &Path) -> Result<(), AppError> {
@@ -370,21 +498,18 @@ fn emit_json<T: Serialize>(value: &T) -> Result<(), AppError> {
         .map_err(|source| file_error("write stdout", PathBuf::from("/dev/stdout"), source))
 }
 
-fn emit_stdout<T: Serialize>(value: &T) -> ExitCode {
-    match emit_json(value) {
-        Ok(()) => ExitCode::SUCCESS,
-        Err(source) => {
-            let output = CliErrorOutput {
-                ok: false,
-                error: CliErrorBody {
-                    code: source.code().to_owned(),
-                    message: source.to_string(),
-                },
-            };
-            emit_stderr(&output);
-            ExitCode::FAILURE
-        }
+fn emit_text_stdout(value: &str) -> Result<(), AppError> {
+    let stdout = io::stdout();
+    let mut handle = stdout.lock();
+    handle
+        .write_all(value.as_bytes())
+        .map_err(|source| file_error("write stdout", PathBuf::from("/dev/stdout"), source))?;
+    if !value.ends_with('\n') {
+        handle
+            .write_all(b"\n")
+            .map_err(|source| file_error("write stdout", PathBuf::from("/dev/stdout"), source))?;
     }
+    Ok(())
 }
 
 fn emit_stderr<T: Serialize>(value: &T) {

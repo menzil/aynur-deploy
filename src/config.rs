@@ -32,8 +32,7 @@ struct ProjectConfig {
     project_id: String,
     repository_full_name: String,
     repository_url: String,
-    token_environment_file: PathBuf,
-    token_environment_variable: String,
+    webhook_token: String,
     tag_pattern: String,
     retain_releases: usize,
     health_check: HealthCheckConfig,
@@ -229,6 +228,7 @@ fn validate_global(path: &Path, config: &GlobalConfig) -> Result<(), AppError> {
 }
 
 fn load_project(path: &Path) -> Result<Project, AppError> {
+    validate_private_file(path, "projectConfig", path)?;
     let text = fs::read_to_string(path)
         .map_err(|source| file_error("read", path.to_path_buf(), source))?;
     let config: ProjectConfig = toml::from_str(&text).map_err(|source| AppError::Config {
@@ -253,14 +253,12 @@ fn load_project(path: &Path) -> Result<Project, AppError> {
             reason: "repositoryUrl must be non-empty and contain no control characters".to_owned(),
         });
     }
-    validate_absolute_path(path, "tokenEnvironmentFile", &config.token_environment_file)?;
-    validate_private_file(path, "tokenEnvironmentFile", &config.token_environment_file)?;
-    validate_environment_variable(path, &config.token_environment_variable)?;
-    let webhook_token = read_secret(
-        path,
-        &config.token_environment_file,
-        &config.token_environment_variable,
-    )?;
+    if config.webhook_token.is_empty() || config.webhook_token.chars().any(char::is_control) {
+        return Err(AppError::Config {
+            path: path.to_path_buf(),
+            reason: "webhookToken must be non-empty and contain no control characters".to_owned(),
+        });
+    }
     if !config.tag_pattern.starts_with('^') || !config.tag_pattern.ends_with('$') {
         return Err(AppError::Config {
             path: path.to_path_buf(),
@@ -284,7 +282,7 @@ fn load_project(path: &Path) -> Result<Project, AppError> {
         project_id: config.project_id,
         repository_full_name: config.repository_full_name,
         repository_url: config.repository_url,
-        webhook_token,
+        webhook_token: SecretString(config.webhook_token),
         tag_pattern,
         retain_releases: config.retain_releases,
         health_check,
@@ -360,20 +358,6 @@ fn validate_repository_full_name(path: &Path, value: &str) -> Result<(), AppErro
         return Err(AppError::Config {
             path: path.to_path_buf(),
             reason: format!("repositoryFullName {value:?} is invalid"),
-        });
-    }
-    Ok(())
-}
-
-fn validate_environment_variable(path: &Path, value: &str) -> Result<(), AppError> {
-    let pattern = Regex::new(r"^[A-Z_][A-Z0-9_]*$").map_err(|source| AppError::Config {
-        path: path.to_path_buf(),
-        reason: format!("internal environment variable regular expression is invalid: {source}"),
-    })?;
-    if !pattern.is_match(value) {
-        return Err(AppError::Config {
-            path: path.to_path_buf(),
-            reason: format!("tokenEnvironmentVariable {value:?} is invalid"),
         });
     }
     Ok(())
@@ -461,54 +445,6 @@ fn validate_positive(path: &Path, field: &str, value: u64) -> Result<(), AppErro
         });
     }
     Ok(())
-}
-
-fn read_secret(
-    config_path: &Path,
-    environment_path: &Path,
-    variable: &str,
-) -> Result<SecretString, AppError> {
-    let text = fs::read_to_string(environment_path)
-        .map_err(|source| file_error("read", environment_path.to_path_buf(), source))?;
-    let mut secret: Option<String> = None;
-    for (index, raw_line) in text.lines().enumerate() {
-        let line = raw_line.trim();
-        if line.is_empty() || line.starts_with('#') {
-            continue;
-        }
-        let (key, value) = line.split_once('=').ok_or_else(|| AppError::Config {
-            path: config_path.to_path_buf(),
-            reason: format!(
-                "token environment file {environment_path:?} line {} must use KEY=value",
-                index + 1
-            ),
-        })?;
-        if key == variable {
-            if secret.is_some() {
-                return Err(AppError::Config {
-                    path: config_path.to_path_buf(),
-                    reason: format!(
-                        "token environment file {environment_path:?} defines {variable} more than once"
-                    ),
-                });
-            }
-            if value.is_empty() {
-                return Err(AppError::Config {
-                    path: config_path.to_path_buf(),
-                    reason: format!(
-                        "token environment file {environment_path:?} defines an empty {variable}"
-                    ),
-                });
-            }
-            secret = Some(value.to_owned());
-        }
-    }
-    secret.map(SecretString).ok_or_else(|| AppError::Config {
-        path: config_path.to_path_buf(),
-        reason: format!(
-            "token environment file {environment_path:?} does not define required variable {variable}"
-        ),
-    })
 }
 
 #[cfg(test)]

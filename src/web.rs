@@ -88,21 +88,28 @@ async fn gitee_hook(
             .map_err(|source| AppError::RequestValidation {
                 reason: format!("X-Gitee-Ping header is not valid ASCII: {source}"),
             })?;
-        if ping_value != "true" {
-            return Err(AppError::RequestValidation {
-                reason: format!("X-Gitee-Ping must be exactly \"true\", got {ping_value:?}"),
-            });
+        match ping_value {
+            "true" => {
+                return Ok((
+                    StatusCode::OK,
+                    Json(HookResponse {
+                        ok: true,
+                        accepted: false,
+                        duplicate: false,
+                        reason: Some("ping"),
+                        deployment: None,
+                    }),
+                ));
+            }
+            "false" => {}
+            _ => {
+                return Err(AppError::RequestValidation {
+                    reason: format!(
+                        "X-Gitee-Ping must be exactly \"true\" or \"false\", got {ping_value:?}"
+                    ),
+                });
+            }
         }
-        return Ok((
-            StatusCode::OK,
-            Json(HookResponse {
-                ok: true,
-                accepted: false,
-                duplicate: false,
-                reason: Some("ping"),
-                deployment: None,
-            }),
-        ));
     }
 
     let body = body.map_err(|source| {

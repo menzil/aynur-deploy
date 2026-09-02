@@ -1,40 +1,69 @@
 # aynur-deploy
 
-`aynur-deploy` accepts authenticated Gitee Tag WebHooks and serializes deployments through SQLite. It fetches the exact Tag object, builds an immutable release, atomically replaces a `current` symlink, checks the configured HTTP endpoint, and rolls back on failure.
+`aynur-deploy` 接收 Gitee Tag Push WebHook，按 Tag 对指定仓库做原子发布，并在健康检查失败时自动回滚。一个服务可以管理多个项目，部署任务按 FIFO 顺序串行执行。
 
-The supported release targets are `static` and `rust_aynur`. Rust releases always run `cargo build --release --locked --package <package> --bin <binary>` and invoke only `aynur reload <app> --update-env`; the app must already be registered in the configured `AYNUR_HOME`.
+## 安装与首次配置
 
-## Commands
-
-Every command requires an explicit configuration path and writes one JSON object to stdout or stderr.
+生产机只安装已经在兼容的 Linux 主机上编译好的二进制，不在生产机编译 Rust。默认配置目录是 `/etc/aynur-deploy`，特殊安装目录可通过 `--home` 覆盖。
 
 ```bash
-aynur-deploy check-config --config /etc/aynur-deploy/config.toml
-aynur-deploy status --config /etc/aynur-deploy/config.toml --project-id orhan-blog
-aynur-deploy retry --config /etc/aynur-deploy/config.toml --deployment-id <deployment-id>
-aynur-deploy rollback --config /etc/aynur-deploy/config.toml --project-id orhan-blog --commit-sha <commit-sha>
-aynur-deploy unblock --config /etc/aynur-deploy/config.toml --project-id orhan-blog
-aynur-deploy serve --config /etc/aynur-deploy/config.toml
+cargo install aynur-deploy --locked
+sudo aynur-deploy init
+sudo aynur-deploy add orhan-blog
 ```
 
-Configuration files reject unknown fields and require every documented field. Each project's WebHook token is read from its configured environment file; that file must be a regular file with mode `0600`.
+`init` 首次运行创建 `config.toml` 和 `projects/`。随后用 `add <projectId>` 创建项目配置；每个项目都会自动生成自己的 `webhookToken`。编辑项目 TOML，至少填写正确的 `repositoryFullName`、`repositoryUrl` 和健康检查 URL：
 
-## Host Layout
+```toml
+projectId = "orhan-blog"
+repositoryFullName = "aynurcn/blog_public"
+repositoryUrl = "https://gitee.com/aynurcn/blog_public.git"
+webhookToken = "由 add 自动生成的随机密码"
+tagPattern = "^deploy-[0-9]{8}-[0-9]{6}$"
+retainReleases = 3
 
-The production assets in `ops/` expect:
+[healthCheck]
+url = "https://orhan.cn/95194bdc694f0283a5e145363cbbcf42.txt"
+attempts = 5
+intervalMs = 2000
+timeoutMs = 5000
 
-```text
-/usr/local/bin/aynur-deploy
-/usr/local/bin/aynur
-/var/lib/aynur-deploy/cargo/bin/cargo
-/etc/aynur-deploy/config.toml
-/etc/aynur-deploy/projects/orhan-blog.toml
-/etc/aynur-deploy/secrets/orhan-blog.env
-/var/lib/aynur-deploy/
+[deployment]
+type = "static"
+entryFile = "index.html"
 ```
 
-Install `aynur-deploy` as a prebuilt Linux binary produced on a compatible Ubuntu/glibc build host. Do not compile it on the production host. Cargo and Aynur are required only when at least one configured project uses the `rust_aynur` target; static-only deployments do not require either executable to be installed.
+把 `webhookToken` 填入 Gitee 仓库的 Tag Push WebHook Password，URL 指向反向代理后的 `/v1/hooks/gitee/orhan-blog`。Token 不会写入日志；项目 TOML 必须保持 `0600`。
 
-The systemd unit runs as the dedicated `deploy` user and permits writes only below `/var/lib/aynur-deploy`. The Nginx configuration exposes only the project-specific hook route and continues to perform authentication in the Rust service.
+## 启动与操作
 
-Before enabling the unit, run `check-config`, ensure the `deploy` user can fetch every configured repository, and register each Rust application in its configured Aynur home. Validate Nginx with `nginx -t` before reload.
+服务的进程守护由 systemd 或 Aynur 负责，`aynur-deploy` 自身只负责部署。检查配置并运行服务：
+
+```bash
+aynur-deploy check
+aynur-deploy serve
+```
+
+生产环境也可以让 systemd 运行同一个 `serve` 命令：
+
+```bash
+sudo systemctl enable --now aynur-deploy
+aynur-deploy status orhan-blog
+```
+
+新增项目时执行 `add`，编辑生成的 TOML 后重启服务使配置生效：
+
+```bash
+sudo aynur-deploy add another-project
+sudo systemctl restart aynur-deploy
+```
+
+其他运维命令：
+
+```bash
+aynur-deploy retry <deploymentId>
+aynur-deploy rollback orhan-blog <commitSha>
+aynur-deploy unblock orhan-blog
+```
+
+默认监听 `127.0.0.1:9091`；生产环境由 Nginx 提供 HTTPS 并转发 WebHook。`GET /healthz` 只检查服务和 SQLite 是否可用。

@@ -11,7 +11,7 @@ WorkingDirectory=/var/lib/aynur-deploy
 Environment=HOME=/var/lib/aynur-deploy
 Environment=CARGO_HOME=/var/lib/aynur-deploy/cargo
 Environment=RUSTUP_HOME=/var/lib/aynur-deploy/rustup
-ExecStart=/usr/local/bin/aynur-deploy serve --config /etc/aynur-deploy/config.toml
+ExecStart=/usr/local/bin/aynur-deploy serve
 Restart=on-failure
 RestartSec=5s
 UMask=0077

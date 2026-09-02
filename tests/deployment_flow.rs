@@ -560,9 +560,6 @@ fn write_config(
 ) -> PathBuf {
     let projects_directory = root.join("projects");
     fs::create_dir(&projects_directory).unwrap();
-    let token_path = root.join("token.env");
-    fs::write(&token_path, format!("GITEE_TOKEN={TOKEN}\n")).unwrap();
-    fs::set_permissions(&token_path, fs::Permissions::from_mode(0o600)).unwrap();
     let config_path = root.join("config.toml");
     fs::write(
         &config_path,
@@ -594,8 +591,7 @@ workerPollIntervalMs = 10
 projectId = "{PROJECT_ID}"
 repositoryFullName = "{REPOSITORY_FULL_NAME}"
 repositoryUrl = "{}"
-tokenEnvironmentFile = "{}"
-tokenEnvironmentVariable = "GITEE_TOKEN"
+webhookToken = "{TOKEN}"
 tagPattern = "^deploy-[0-9]{{8}}-[0-9]{{6}}$"
 retainReleases = 3
 
@@ -610,8 +606,12 @@ type = "static"
 entryFile = "index.html"
 "#,
             repository_url.display(),
-            token_path.display(),
         ),
+    )
+    .unwrap();
+    fs::set_permissions(
+        projects_directory.join("test-static.toml"),
+        fs::Permissions::from_mode(0o600),
     )
     .unwrap();
     config_path
@@ -689,6 +689,7 @@ async fn send_webhook(app: Router, token: &str, payload: Value) -> (StatusCode, 
             Request::post(format!("/v1/hooks/gitee/{PROJECT_ID}"))
                 .header("content-type", "application/json")
                 .header("x-gitee-token", token)
+                .header("x-gitee-ping", "false")
                 .body(Body::from(serde_json::to_vec(&payload).unwrap()))
                 .unwrap(),
         )

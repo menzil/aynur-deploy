@@ -1,8 +1,7 @@
 projectId = "orhan-blog"
 repositoryFullName = "aynurcn/blog_public"
 repositoryUrl = "https://gitee.com/aynurcn/blog_public.git"
-tokenEnvironmentFile = "/etc/aynur-deploy/secrets/orhan-blog.env"
-tokenEnvironmentVariable = "GITEE_WEBHOOK_TOKEN"
+webhookToken = "replace-with-a-unique-webhook-token"
 tagPattern = "^deploy-[0-9]{8}-[0-9]{6}$"
 retainReleases = 3
 
