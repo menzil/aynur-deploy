@@ -39,7 +39,7 @@ aynur-deploy add orhan-blog
 projectId = "orhan-blog"
 currentPath = "/var/www/blog_public"
 repositoryFullName = "aynurcn/blog_public"
-repositoryUrl = "https://gitee.com/aynurcn/blog_public.git"
+repositoryUrl = "git@gitee.com:aynurcn/blog_public.git"
 webhookToken = "由 add 自动生成的随机密码"
 tagPattern = "^deploy-[0-9]{8}-[0-9]{6}$"
 retainReleases = 3
@@ -54,6 +54,8 @@ timeoutMs = 5000
 type = "static"
 entryFile = "index.html"
 ```
+
+`repositoryUrl` 可以使用 HTTPS、本地路径或 Git SSH 地址。生产环境推荐给运行 `aynur-deploy serve` 的系统用户配置只读 Deploy Key，并提前验证该用户的 `known_hosts`。无人值守服务不能依赖交互式密码或首次连接确认；带口令的私钥还需要服务进程可访问的 `ssh-agent`。不要把 HTTPS 用户名或 Token 嵌入 URL，因为 Git 命令失败时 URL 可能出现在错误日志中。修改已有项目的仓库地址时，还要同步修改 `stateDirectory/mirrors/<projectId>.git` 的 `origin`，服务会拒绝配置地址与 mirror 地址不一致的部署。
 
 `currentPath` 是必填的绝对路径。`add` 未指定 `--current-path` 时会写入默认路径；指定后则原样写入项目 TOML，并自动接管该位置已有的目录。配置加载时，该路径必须不存在或已经是软链。release 仍保存在 `stateDirectory/projects/<projectId>/releases/<commitSha>`，部署时只原子切换 `currentPath` 软链。首次部署确认成功前不要删除 `bootstrapPath`，它是首次健康检查失败时的回滚目标。
 
@@ -85,17 +87,36 @@ aynur-deploy add my-service --type rust
 [deployment]
 type = "rust"
 cargoManifest = "Cargo.toml"
-package = "my-service"
-binary = "my-service"
+includePaths = ["Toasty.toml", "profiles", "toasty"]
+binaries = [
+    { package = "gateway", binary = "gateway" },
+    { package = "migrator", binary = "migrator" },
+]
+environmentFile = "/etc/my-service.env"
 ```
+
+`binaries` 至少包含一个 `{ package, binary }`，目标文件名必须唯一。服务对所有目标执行一次 `cargo build --release --locked`，随后把指定二进制复制到 release 根目录。`includePaths` 相对于本次 Tag 的临时 Git worktree 根目录解析；文件原样复制，目录递归复制，缺失或越界路径会使部署失败。
+
+`environmentFile` 是可选的生产环境文件绝对路径，必须是权限 `0600` 的普通文件。它不会进入 release，也不会写入日志；其中的变量提供给 Cargo build 和 migration，并覆盖部署服务进程中的同名变量。密钥、数据库和上传文件应保存在 release 目录之外。
+
+需要在切换 release 前执行数据库迁移时，配置一条固定 argv 命令。命令只在正向部署中执行，工作目录是候选 release；迁移失败不会切换 `currentPath`。进程在迁移期间重启时会重新执行该命令，因此迁移工具必须能够安全重复执行：
+
+```toml
+[migration]
+command = ["./migrator", "migration", "apply"]
+```
+
+数据库迁移不会在显式回滚或健康检查回滚时逆向执行。需要自动应用回滚的项目，migration 必须兼容上一版应用。
 
 Node SSR 服务不属于 `static`：应先在构建环境产出可部署的二进制或其他固定运行产物，再使用 `binary`；服务编排由 Aynur 等独立进程管理器负责。
 
-需要在切换发布后执行进程 reload 时，额外添加独立配置。命令使用固定 argv，可以使用 Aynur、PM2 或其他受信任的进程管理器，不经过 Shell：
+需要在切换发布后执行进程 reload 时，额外添加独立配置。多条命令按顺序执行、遇错停止，并在正向激活和应用回滚后执行。命令使用固定 argv，可以使用 Aynur、PM2 或其他受信任的进程管理器，不经过 Shell：
 
 ```toml
 [reload]
-command = ["aynur", "reload", "orhan-api", "--update-env"]
+commands = [
+    ["aynur", "reload", "orhan-api", "--update-env"],
+]
 ```
 
 把 `webhookToken` 填入 Gitee 仓库的 Tag Push WebHook Password，URL 指向反向代理后的 `/v1/hooks/gitee/orhan-blog`。Token 不会写入日志；项目 TOML 必须保持 `0600`。
@@ -158,7 +179,7 @@ aynur-deploy check
 aynur-deploy serve
 ```
 
-查看当前配置的所有部署项目及其发布路径：
+查看当前配置的所有部署项目、运行状态及其发布路径：
 
 ```bash
 aynur-deploy list
@@ -181,9 +202,16 @@ sudo systemctl restart aynur-deploy
 其他运维命令：
 
 ```bash
+aynur-deploy stop orhan-blog
+aynur-deploy start orhan-blog
+aynur-deploy delete orhan-blog
 aynur-deploy retry <deploymentId>
 aynur-deploy rollback orhan-blog <commitSha>
 aynur-deploy unblock orhan-blog
 ```
+
+`stop` 会持久化停止状态：新的 Tag WebHook 返回 `409 projectStopped`，排队任务暂停；已经开始构建、迁移或切换的任务会继续完成。`start` 恢复接收和处理，但不会解除部署失败产生的 `blocked` 状态，必须先处理故障并执行 `unblock`。
+
+`delete` 只允许删除已经停止且没有执行中任务的项目。它会删除项目 TOML、项目状态和部署历史，但保留 `currentPath`、release、mirror 和其他发布文件，因此不会同时下线当前应用。运行中的 `aynur-deploy serve` 会立即通过数据库状态拒绝已删除项目，不要求重启。
 
 默认监听 `127.0.0.1:9091`。`GET /healthz` 只检查服务和 SQLite 是否可用。

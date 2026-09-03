@@ -25,7 +25,7 @@ fn version_uses_plain_text() {
         .output()
         .expect("version command must start");
     assert!(output.status.success());
-    assert_eq!(output.stdout, b"aynur-deploy 0.3.0\n");
+    assert_eq!(output.stdout, b"aynur-deploy 0.4.0\n");
 }
 
 #[test]
@@ -160,6 +160,12 @@ fn init_creates_private_project_config_with_generated_token() {
             .expect("typed project config must exist");
         assert!(text.contains(expected));
         assert!(text.contains("# [reload]"));
+        assert!(text.contains("# commands = [["));
+        if deployment_type == "rust" {
+            assert!(text.contains("binaries = [{ package = \"my-service\""));
+            assert!(text.contains("includePaths = []"));
+            assert!(text.contains("# [migration]"));
+        }
         let expected_current_path = current_path.map_or_else(
             || {
                 latest_home
@@ -184,12 +190,81 @@ fn init_creates_private_project_config_with_generated_token() {
     let list_json: Value = serde_json::from_slice(&list.stdout).expect("list output must be JSON");
     assert_eq!(list_json["ok"], true);
     assert_eq!(list_json["projects"][0]["projectId"], "latest-project");
+    assert_eq!(list_json["projects"][0]["status"], "running");
     assert_eq!(list_json["projects"][1]["projectId"], "test-binary");
     assert_eq!(
         list_json["projects"][1]["currentPath"],
         custom_current_path.to_str().unwrap()
     );
+    assert_eq!(list_json["projects"][1]["status"], "running");
     assert_eq!(list_json["projects"][2]["projectId"], "test-rust");
+
+    let stop = Command::new(env!("CARGO_BIN_EXE_aynur-deploy"))
+        .args(["stop", "test-binary"])
+        .env("XDG_CONFIG_HOME", &xdg_config_home)
+        .output()
+        .expect("stop command must start");
+    assert!(stop.status.success(), "stderr={:?}", stop.stderr);
+    let stop_json: Value = serde_json::from_slice(&stop.stdout).unwrap();
+    assert_eq!(stop_json["project"]["status"], "stopped");
+
+    let stopped_list = Command::new(env!("CARGO_BIN_EXE_aynur-deploy"))
+        .arg("list")
+        .env("XDG_CONFIG_HOME", &xdg_config_home)
+        .output()
+        .expect("list command must start");
+    assert!(stopped_list.status.success());
+    let stopped_list_json: Value = serde_json::from_slice(&stopped_list.stdout).unwrap();
+    let stopped_project = stopped_list_json["projects"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|project| project["projectId"] == "test-binary")
+        .unwrap();
+    assert_eq!(stopped_project["status"], "stopped");
+
+    let start = Command::new(env!("CARGO_BIN_EXE_aynur-deploy"))
+        .args(["start", "test-binary"])
+        .env("XDG_CONFIG_HOME", &xdg_config_home)
+        .output()
+        .expect("start command must start");
+    assert!(start.status.success(), "stderr={:?}", start.stderr);
+    let start_json: Value = serde_json::from_slice(&start.stdout).unwrap();
+    assert_eq!(start_json["project"]["status"], "running");
+
+    let running_delete = Command::new(env!("CARGO_BIN_EXE_aynur-deploy"))
+        .args(["delete", "test-binary"])
+        .env("XDG_CONFIG_HOME", &xdg_config_home)
+        .output()
+        .expect("delete command must start");
+    assert!(!running_delete.status.success());
+    let running_delete_json: Value = serde_json::from_slice(&running_delete.stderr).unwrap();
+    assert_eq!(running_delete_json["error"]["code"], "projectMustBeStopped");
+    assert!(latest_home.join("projects/test-binary.toml").is_file());
+
+    let release_path = latest_home.join("state/projects/test-binary/releases/release-one");
+    fs::create_dir_all(&release_path).unwrap();
+    fs::write(release_path.join("test-binary"), "preserved").unwrap();
+    fs::create_dir_all(custom_current_path.parent().unwrap()).unwrap();
+    std::os::unix::fs::symlink(&release_path, &custom_current_path).unwrap();
+    let final_stop = Command::new(env!("CARGO_BIN_EXE_aynur-deploy"))
+        .args(["stop", "test-binary"])
+        .env("XDG_CONFIG_HOME", &xdg_config_home)
+        .output()
+        .unwrap();
+    assert!(final_stop.status.success());
+    let delete = Command::new(env!("CARGO_BIN_EXE_aynur-deploy"))
+        .args(["delete", "test-binary"])
+        .env("XDG_CONFIG_HOME", &xdg_config_home)
+        .output()
+        .expect("delete command must start");
+    assert!(delete.status.success(), "stderr={:?}", delete.stderr);
+    assert!(!latest_home.join("projects/test-binary.toml").exists());
+    assert_eq!(fs::read_link(&custom_current_path).unwrap(), release_path);
+    assert_eq!(
+        fs::read_to_string(custom_current_path.join("test-binary")).unwrap(),
+        "preserved"
+    );
 
     let relative = Command::new(env!("CARGO_BIN_EXE_aynur-deploy"))
         .args(["add", "invalid-path", "--current-path", "relative/current"])

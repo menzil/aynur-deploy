@@ -10,7 +10,9 @@ use tokio::sync::{Notify, watch};
 use tracing::{error, info, warn};
 use walkdir::WalkDir;
 
-use crate::config::{DeploymentTarget, LoadedConfig, Project};
+use crate::config::{
+    ConfiguredCommand, DeploymentTarget, LoadedConfig, Project, RustBinary, load_environment_file,
+};
 use crate::db::Database;
 use crate::error::{AppError, file_error};
 use crate::model::{Deployment, DeploymentKind, DeploymentStatus};
@@ -21,6 +23,13 @@ pub struct Deployer {
     config: Arc<LoadedConfig>,
     database: Database,
     http_client: Client,
+}
+
+struct RustReleaseSpec<'a> {
+    cargo_manifest: &'a Path,
+    binaries: &'a [RustBinary],
+    include_paths: &'a [PathBuf],
+    environment_file: Option<&'a Path>,
 }
 
 impl Deployer {
@@ -52,7 +61,12 @@ impl Deployer {
         match deployment.status {
             DeploymentStatus::Queued | DeploymentStatus::Fetching | DeploymentStatus::Building => {
                 let release_path = match deployment.kind {
-                    DeploymentKind::Deploy => self.prepare_release(project, deployment).await?,
+                    DeploymentKind::Deploy => {
+                        let release_path = self.prepare_release(project, deployment).await?;
+                        self.migrate_if_required(project, deployment, &release_path)
+                            .await?;
+                        release_path
+                    }
                     DeploymentKind::Rollback => {
                         deployment
                             .release_path
@@ -66,6 +80,40 @@ impl Deployer {
                     }
                 };
                 self.activate(project, deployment, &release_path).await
+            }
+            DeploymentStatus::Migrating => {
+                if deployment.kind != DeploymentKind::Deploy {
+                    return Err(AppError::InvalidState {
+                        reason: format!(
+                            "rollback deployment {} cannot be in migrating state",
+                            deployment.id
+                        ),
+                    });
+                }
+                let release_path =
+                    deployment
+                        .release_path
+                        .as_deref()
+                        .ok_or_else(|| AppError::InvalidState {
+                            reason: format!(
+                                "migrating deployment {} has no releasePath",
+                                deployment.id
+                            ),
+                        })?;
+                validate_release(project, release_path)?;
+                let migration =
+                    project
+                        .migration
+                        .as_ref()
+                        .ok_or_else(|| AppError::InvalidState {
+                            reason: format!(
+                                "migrating deployment {} requires migration configuration",
+                                deployment.id
+                            ),
+                        })?;
+                self.run_migration(project, deployment, release_path, migration)
+                    .await?;
+                self.activate(project, deployment, release_path).await
             }
             DeploymentStatus::Activating | DeploymentStatus::HealthChecking => {
                 self.recover_after_activation(
@@ -104,7 +152,10 @@ impl Deployer {
             "deployment stage failed"
         );
         match deployment.status {
-            DeploymentStatus::Queued | DeploymentStatus::Fetching | DeploymentStatus::Building => {
+            DeploymentStatus::Queued
+            | DeploymentStatus::Fetching
+            | DeploymentStatus::Building
+            | DeploymentStatus::Migrating => {
                 self.database
                     .mark_failed(&deployment.id, source.code(), &source.to_string())
                     .await
@@ -427,16 +478,20 @@ impl Deployer {
             }
             DeploymentTarget::Rust {
                 cargo_manifest,
-                package,
-                binary,
+                binaries,
+                include_paths,
+                environment_file,
             } => {
-                self.build_rust_binary(
+                self.build_rust_release(
                     deployment,
                     worktree_path,
                     &temporary_release,
-                    cargo_manifest,
-                    package,
-                    binary,
+                    RustReleaseSpec {
+                        cargo_manifest,
+                        binaries,
+                        include_paths,
+                        environment_file: environment_file.as_deref(),
+                    },
                 )
                 .await
             }
@@ -458,16 +513,14 @@ impl Deployer {
         Ok(())
     }
 
-    async fn build_rust_binary(
+    async fn build_rust_release(
         &self,
         deployment: &Deployment,
         worktree_path: &Path,
         temporary_release: &Path,
-        cargo_manifest: &Path,
-        package: &str,
-        binary: &str,
+        release_spec: RustReleaseSpec<'_>,
     ) -> Result<(), AppError> {
-        let manifest_path = worktree_path.join(cargo_manifest);
+        let manifest_path = worktree_path.join(release_spec.cargo_manifest);
         if !manifest_path.is_file() {
             return Err(AppError::InvalidState {
                 reason: format!("Cargo manifest {manifest_path:?} does not exist"),
@@ -482,43 +535,40 @@ impl Deployer {
         remove_directory_if_exists(&target_directory)?;
         fs::create_dir_all(&target_directory)
             .map_err(|source| file_error("create directory", target_directory.clone(), source))?;
+        let mut args = vec![
+            os("build"),
+            os("--release"),
+            os("--locked"),
+            os("--manifest-path"),
+            manifest_path.as_os_str().to_owned(),
+        ];
+        for binary in release_spec.binaries {
+            args.extend([
+                os("--package"),
+                OsString::from(&binary.package),
+                os("--bin"),
+                OsString::from(&binary.binary),
+            ]);
+        }
+        let mut environment = load_optional_environment_file(release_spec.environment_file)?;
+        environment.push((
+            os("CARGO_TARGET_DIR"),
+            target_directory.as_os_str().to_owned(),
+        ));
         let spec = CommandSpec {
             program: self.config.global.cargo_command.clone(),
-            args: vec![
-                os("build"),
-                os("--release"),
-                os("--locked"),
-                os("--manifest-path"),
-                manifest_path.as_os_str().to_owned(),
-                os("--package"),
-                OsString::from(package),
-                os("--bin"),
-                OsString::from(binary),
-            ],
+            args,
             current_directory: Some(worktree_path.to_path_buf()),
-            environment: vec![(
-                os("CARGO_TARGET_DIR"),
-                target_directory.as_os_str().to_owned(),
-            )],
+            environment,
         };
         let build_and_copy_result = async {
             run_command(&spec, self.config.global.command_timeout_seconds).await?;
-            let source_binary = target_directory.join("release").join(binary);
-            if !source_binary.is_file() {
-                return Err(AppError::InvalidState {
-                    reason: format!(
-                        "Cargo build succeeded but expected binary {source_binary:?} does not exist"
-                    ),
-                });
+            for binary in release_spec.binaries {
+                copy_rust_binary(&target_directory, temporary_release, binary)?;
             }
-            let destination_binary = temporary_release.join(binary);
-            fs::copy(&source_binary, &destination_binary)
-                .map_err(|source| file_error("copy", source_binary.clone(), source))?;
-            let permissions = fs::metadata(&source_binary)
-                .map_err(|source| file_error("read metadata", source_binary.clone(), source))?
-                .permissions();
-            fs::set_permissions(&destination_binary, permissions)
-                .map_err(|source| file_error("set permissions", destination_binary, source))?;
+            for include_path in release_spec.include_paths {
+                copy_release_path(worktree_path, temporary_release, include_path)?;
+            }
             Ok(())
         }
         .await;
@@ -533,6 +583,53 @@ impl Deployer {
                 ),
             }),
         }
+    }
+
+    async fn migrate_if_required(
+        &self,
+        project: &Project,
+        deployment: &Deployment,
+        release_path: &Path,
+    ) -> Result<(), AppError> {
+        let Some(migration) = &project.migration else {
+            return Ok(());
+        };
+        self.run_migration(project, deployment, release_path, migration)
+            .await
+    }
+
+    async fn run_migration(
+        &self,
+        project: &Project,
+        deployment: &Deployment,
+        release_path: &Path,
+        migration: &ConfiguredCommand,
+    ) -> Result<(), AppError> {
+        self.database
+            .set_status(&deployment.id, DeploymentStatus::Migrating)
+            .await?;
+        let environment_file = match &project.deployment {
+            DeploymentTarget::Rust {
+                environment_file, ..
+            } => environment_file.as_deref(),
+            DeploymentTarget::Static { .. } | DeploymentTarget::Binary { .. } => None,
+        };
+        let spec = command_spec(
+            migration,
+            Some(release_path.to_path_buf()),
+            load_optional_environment_file(environment_file)?,
+        );
+        run_command(&spec, self.config.global.command_timeout_seconds).await?;
+        info!(
+            projectId = %deployment.project_id,
+            deploymentId = %deployment.id,
+            tag = %deployment.tag,
+            commitSha = deployment.commit_sha.as_deref().unwrap_or(&deployment.requested_sha),
+            stage = "migrating",
+            migrationProgram = %migration.program.display(),
+            "migration command completed"
+        );
+        Ok(())
     }
 
     async fn activate(
@@ -769,25 +866,20 @@ impl Deployer {
         project: &Project,
         deployment: &Deployment,
     ) -> Result<(), AppError> {
-        let Some(reload) = &project.reload else {
-            return Ok(());
-        };
-        let spec = CommandSpec {
-            program: reload.program.clone(),
-            args: reload.args.clone(),
-            current_directory: None,
-            environment: Vec::new(),
-        };
-        run_command(&spec, self.config.global.command_timeout_seconds).await?;
-        info!(
-            projectId = %deployment.project_id,
-            deploymentId = %deployment.id,
-            tag = %deployment.tag,
-            commitSha = deployment.commit_sha.as_deref().unwrap_or(&deployment.requested_sha),
-            stage = "reload",
-            reloadProgram = %reload.program.display(),
-            "reload command completed"
-        );
+        for (index, reload) in project.reload.iter().enumerate() {
+            let spec = command_spec(reload, None, Vec::new());
+            run_command(&spec, self.config.global.command_timeout_seconds).await?;
+            info!(
+                projectId = %deployment.project_id,
+                deploymentId = %deployment.id,
+                tag = %deployment.tag,
+                commitSha = deployment.commit_sha.as_deref().unwrap_or(&deployment.requested_sha),
+                stage = "reload",
+                reloadIndex = index,
+                reloadProgram = %reload.program.display(),
+                "reload command completed"
+            );
+        }
         Ok(())
     }
 
@@ -1005,6 +1097,61 @@ fn copy_prebuilt_binary(
     Ok(())
 }
 
+fn copy_rust_binary(
+    target_directory: &Path,
+    destination_root: &Path,
+    binary: &RustBinary,
+) -> Result<(), AppError> {
+    let source_binary = target_directory.join("release").join(&binary.binary);
+    let metadata = fs::metadata(&source_binary)
+        .map_err(|source| file_error("read metadata", source_binary.clone(), source))?;
+    if !metadata.is_file() || metadata.permissions().mode() & 0o111 == 0 {
+        return Err(AppError::InvalidState {
+            reason: format!(
+                "Cargo build succeeded but expected executable binary {source_binary:?} does not exist"
+            ),
+        });
+    }
+    let destination_binary = destination_root.join(&binary.binary);
+    fs::copy(&source_binary, &destination_binary)
+        .map_err(|source| file_error("copy", source_binary, source))?;
+    fs::set_permissions(&destination_binary, metadata.permissions())
+        .map_err(|source| file_error("set permissions", destination_binary, source))?;
+    Ok(())
+}
+
+fn copy_release_path(
+    source_root: &Path,
+    destination_root: &Path,
+    relative_path: &Path,
+) -> Result<(), AppError> {
+    let source_path = source_root.join(relative_path);
+    let destination_path = destination_root.join(relative_path);
+    let metadata = fs::symlink_metadata(&source_path)
+        .map_err(|source| file_error("read metadata", source_path.clone(), source))?;
+    if metadata.file_type().is_file() {
+        if let Some(parent) = destination_path.parent() {
+            fs::create_dir_all(parent)
+                .map_err(|source| file_error("create directory", parent.to_path_buf(), source))?;
+        }
+        fs::copy(&source_path, &destination_path)
+            .map_err(|source| file_error("copy", source_path.clone(), source))?;
+        fs::set_permissions(&destination_path, metadata.permissions())
+            .map_err(|source| file_error("set permissions", destination_path, source))?;
+        return Ok(());
+    }
+    if metadata.file_type().is_dir() {
+        fs::create_dir_all(&destination_path)
+            .map_err(|source| file_error("create directory", destination_path.clone(), source))?;
+        return copy_static_tree(&source_path, &destination_path);
+    }
+    Err(AppError::InvalidState {
+        reason: format!(
+            "included release path {source_path:?} must be a regular file or directory"
+        ),
+    })
+}
+
 fn copy_static_tree(source: &Path, destination: &Path) -> Result<(), AppError> {
     for entry_result in WalkDir::new(source)
         .follow_links(false)
@@ -1077,31 +1224,74 @@ fn validate_release(project: &Project, release_path: &Path) -> Result<(), AppErr
             reason: format!("release path {release_path:?} is not a directory"),
         });
     }
-    let entry_path = match &project.deployment {
-        DeploymentTarget::Static { entry_file } => release_path.join(entry_file),
-        DeploymentTarget::Binary { binary_path } => release_path.join(binary_path),
-        DeploymentTarget::Rust { binary, .. } => release_path.join(binary),
-    };
-    if !entry_path.is_file() {
-        return Err(AppError::InvalidState {
-            reason: format!("release entry {entry_path:?} is not a regular file"),
-        });
-    }
-    if matches!(
-        project.deployment,
-        DeploymentTarget::Binary { .. } | DeploymentTarget::Rust { .. }
-    ) {
-        let mode = fs::metadata(&entry_path)
-            .map_err(|source| file_error("read metadata", entry_path.clone(), source))?
-            .permissions()
-            .mode();
-        if mode & 0o111 == 0 {
-            return Err(AppError::InvalidState {
-                reason: format!("release entry {entry_path:?} is not executable"),
-            });
+    match &project.deployment {
+        DeploymentTarget::Static { entry_file } => {
+            validate_release_file(&release_path.join(entry_file), false)?;
+        }
+        DeploymentTarget::Binary { binary_path } => {
+            validate_release_file(&release_path.join(binary_path), true)?;
+        }
+        DeploymentTarget::Rust {
+            binaries,
+            include_paths,
+            ..
+        } => {
+            for binary in binaries {
+                validate_release_file(&release_path.join(&binary.binary), true)?;
+            }
+            for include_path in include_paths {
+                let path = release_path.join(include_path);
+                let metadata = fs::symlink_metadata(&path)
+                    .map_err(|source| file_error("read metadata", path.clone(), source))?;
+                if !metadata.file_type().is_file() && !metadata.file_type().is_dir() {
+                    return Err(AppError::InvalidState {
+                        reason: format!(
+                            "included release path {path:?} is not a regular file or directory"
+                        ),
+                    });
+                }
+            }
         }
     }
     Ok(())
+}
+
+fn validate_release_file(path: &Path, executable: bool) -> Result<(), AppError> {
+    let metadata = fs::metadata(path)
+        .map_err(|source| file_error("read metadata", path.to_path_buf(), source))?;
+    if !metadata.is_file() {
+        return Err(AppError::InvalidState {
+            reason: format!("release entry {path:?} is not a regular file"),
+        });
+    }
+    if executable && metadata.permissions().mode() & 0o111 == 0 {
+        return Err(AppError::InvalidState {
+            reason: format!("release entry {path:?} is not executable"),
+        });
+    }
+    Ok(())
+}
+
+fn command_spec(
+    command: &ConfiguredCommand,
+    current_directory: Option<PathBuf>,
+    environment: Vec<(OsString, OsString)>,
+) -> CommandSpec {
+    CommandSpec {
+        program: command.program.clone(),
+        args: command.args.clone(),
+        current_directory,
+        environment,
+    }
+}
+
+fn load_optional_environment_file(
+    path: Option<&Path>,
+) -> Result<Vec<(OsString, OsString)>, AppError> {
+    match path {
+        Some(path) => load_environment_file(path),
+        None => Ok(Vec::new()),
+    }
 }
 
 fn read_current_target(current_path: &Path) -> Result<Option<PathBuf>, AppError> {

@@ -13,7 +13,7 @@ use axum::routing::get;
 use aynur_deploy::config::{LoadedConfig, load_config};
 use aynur_deploy::db::Database;
 use aynur_deploy::deploy::Deployer;
-use aynur_deploy::model::DeploymentStatus;
+use aynur_deploy::model::{DeploymentStatus, ProjectStatus};
 use aynur_deploy::web::{AppState, router};
 use http_body_util::BodyExt;
 use serde_json::Value;
@@ -188,19 +188,130 @@ async fn failed_rollback_blocks_project_until_unblock() {
             .unwrap()
             .blocked
     );
+    environment.database.stop_project(PROJECT_ID).await.unwrap();
+    let start_error = environment
+        .database
+        .start_project(PROJECT_ID)
+        .await
+        .expect_err("start must not bypass a blocked project");
+    assert_eq!(start_error.code(), "projectBlocked");
     environment
         .database
         .unblock_project(PROJECT_ID)
         .await
         .unwrap();
-    assert!(
-        !environment
-            .database
-            .project_state(PROJECT_ID)
-            .await
-            .unwrap()
-            .blocked
-    );
+    let unblocked = environment
+        .database
+        .project_state(PROJECT_ID)
+        .await
+        .unwrap();
+    assert!(!unblocked.blocked);
+    assert!(unblocked.stopped);
+    assert_eq!(unblocked.status, ProjectStatus::Stopped);
+    let started = environment
+        .database
+        .start_project(PROJECT_ID)
+        .await
+        .unwrap();
+    assert_eq!(started.status, ProjectStatus::Running);
+}
+
+#[tokio::test]
+async fn stopped_project_pauses_queued_deployments_until_started() {
+    let environment = setup().await;
+    let queued = environment
+        .database
+        .create_webhook_deployment(
+            PROJECT_ID,
+            "event:paused",
+            "deploy-20260901-120010",
+            "4444444444444444444444444444444444444444",
+        )
+        .await
+        .unwrap()
+        .deployment;
+
+    let stopped = environment.database.stop_project(PROJECT_ID).await.unwrap();
+    assert_eq!(stopped.status, ProjectStatus::Stopped);
+    assert!(environment.database.next_pending().await.unwrap().is_none());
+
+    environment
+        .database
+        .start_project(PROJECT_ID)
+        .await
+        .unwrap();
+    let claimed = environment
+        .database
+        .next_pending()
+        .await
+        .unwrap()
+        .expect("queued deployment must resume after start");
+    assert_eq!(claimed.id, queued.id);
+    assert_eq!(claimed.status, DeploymentStatus::Fetching);
+}
+
+#[tokio::test]
+async fn project_deletion_requires_stop_and_no_active_deployment() {
+    let environment = setup().await;
+    let queued = environment
+        .database
+        .create_webhook_deployment(
+            PROJECT_ID,
+            "event:delete-active",
+            "deploy-20260901-120011",
+            "5555555555555555555555555555555555555555",
+        )
+        .await
+        .unwrap()
+        .deployment;
+    let running_error = environment
+        .database
+        .delete_project(PROJECT_ID)
+        .await
+        .expect_err("running project deletion must fail");
+    assert_eq!(running_error.code(), "projectMustBeStopped");
+
+    let claimed = environment.database.next_pending().await.unwrap().unwrap();
+    assert_eq!(claimed.id, queued.id);
+    environment.database.stop_project(PROJECT_ID).await.unwrap();
+    let active_error = environment
+        .database
+        .delete_project(PROJECT_ID)
+        .await
+        .expect_err("active deployment deletion must fail");
+    assert_eq!(active_error.code(), "projectDeploymentActive");
+
+    environment
+        .database
+        .mark_failed(&queued.id, "testFailure", "test completed")
+        .await
+        .unwrap();
+    environment
+        .database
+        .delete_project(PROJECT_ID)
+        .await
+        .unwrap();
+    let missing = environment
+        .database
+        .project_state(PROJECT_ID)
+        .await
+        .expect_err("deleted project state must be absent");
+    assert_eq!(missing.code(), "projectNotFound");
+
+    let deleted_webhook = send_webhook(
+        webhook_app(&environment),
+        TOKEN,
+        webhook_payload(
+            REPOSITORY_FULL_NAME,
+            "refs/tags/deploy-20260901-120013",
+            "7777777777777777777777777777777777777777",
+            true,
+            false,
+        ),
+    )
+    .await;
+    assert_eq!(deleted_webhook.0, StatusCode::NOT_FOUND);
+    assert_eq!(deleted_webhook.1["error"]["code"], "projectNotFound");
 }
 
 #[tokio::test]
@@ -431,6 +542,22 @@ async fn webhook_authentication_filtering_and_deduplication_are_strict() {
     .await;
     assert_eq!(ignored.0, StatusCode::OK);
     assert_eq!(ignored.1["reason"], "tagPatternMismatch");
+
+    environment.database.stop_project(PROJECT_ID).await.unwrap();
+    let stopped = send_webhook(
+        app.clone(),
+        TOKEN,
+        webhook_payload(
+            REPOSITORY_FULL_NAME,
+            "refs/tags/deploy-20260901-120012",
+            "6666666666666666666666666666666666666666",
+            true,
+            false,
+        ),
+    )
+    .await;
+    assert_eq!(stopped.0, StatusCode::CONFLICT);
+    assert_eq!(stopped.1["error"]["code"], "projectStopped");
 
     let deleted = send_webhook(
         app,

@@ -43,6 +43,7 @@ pub enum DeploymentStatus {
     Queued,
     Fetching,
     Building,
+    Migrating,
     Activating,
     HealthChecking,
     RollingBack,
@@ -57,6 +58,7 @@ impl Display for DeploymentStatus {
             Self::Queued => "queued",
             Self::Fetching => "fetching",
             Self::Building => "building",
+            Self::Migrating => "migrating",
             Self::Activating => "activating",
             Self::HealthChecking => "healthChecking",
             Self::RollingBack => "rollingBack",
@@ -75,6 +77,7 @@ impl FromStr for DeploymentStatus {
             "queued" => Ok(Self::Queued),
             "fetching" => Ok(Self::Fetching),
             "building" => Ok(Self::Building),
+            "migrating" => Ok(Self::Migrating),
             "activating" => Ok(Self::Activating),
             "healthChecking" => Ok(Self::HealthChecking),
             "rollingBack" => Ok(Self::RollingBack),
@@ -157,15 +160,26 @@ impl TryFrom<DeploymentRow> for Deployment {
 #[derive(Debug, Clone, FromRow)]
 pub struct ProjectStateRow {
     pub project_id: String,
+    pub stopped: i64,
     pub blocked: i64,
     pub blocked_reason: Option<String>,
     pub updated_at: String,
+}
+
+#[derive(Debug, Clone, Copy, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub enum ProjectStatus {
+    Running,
+    Stopped,
+    Blocked,
 }
 
 #[derive(Debug, Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct ProjectState {
     pub project_id: String,
+    pub status: ProjectStatus,
+    pub stopped: bool,
     pub blocked: bool,
     pub blocked_reason: Option<String>,
     pub updated_at: String,
@@ -173,9 +187,20 @@ pub struct ProjectState {
 
 impl From<ProjectStateRow> for ProjectState {
     fn from(row: ProjectStateRow) -> Self {
+        let stopped = row.stopped != 0;
+        let blocked = row.blocked != 0;
+        let status = if blocked {
+            ProjectStatus::Blocked
+        } else if stopped {
+            ProjectStatus::Stopped
+        } else {
+            ProjectStatus::Running
+        };
         Self {
             project_id: row.project_id,
-            blocked: row.blocked != 0,
+            status,
+            stopped,
+            blocked,
             blocked_reason: row.blocked_reason,
             updated_at: row.updated_at,
         }

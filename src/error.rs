@@ -22,6 +22,8 @@ pub enum AppError {
         path: PathBuf,
         source: std::io::Error,
     },
+    #[error("environment file {path} is invalid: {reason}")]
+    EnvironmentFile { path: PathBuf, reason: String },
     #[error(
         "command {program:?} {args:?} failed with status {status:?}; stdout={stdout:?}; stderr={stderr:?}"
     )]
@@ -48,6 +50,22 @@ pub enum AppError {
     Authentication { reason: String },
     #[error("project {project_id} was not found")]
     ProjectNotFound { project_id: String },
+    #[error("project {project_id} is stopped; run `aynur-deploy start {project_id}` first")]
+    ProjectStopped { project_id: String },
+    #[error(
+        "project {project_id} is blocked: {reason}; resolve the failure and run `aynur-deploy unblock {project_id}`"
+    )]
+    ProjectBlocked { project_id: String, reason: String },
+    #[error(
+        "project {project_id} must be stopped before deletion; run `aynur-deploy stop {project_id}` first"
+    )]
+    ProjectMustBeStopped { project_id: String },
+    #[error("project {project_id} cannot be deleted while deployment {deployment_id} is {status}")]
+    ProjectDeploymentActive {
+        project_id: String,
+        deployment_id: String,
+        status: String,
+    },
     #[error("deployment {deployment_id} was not found")]
     DeploymentNotFound { deployment_id: String },
     #[error("deployment {deployment_id} is in state {status}, which cannot be retried")]
@@ -72,6 +90,7 @@ impl AppError {
             Self::Config { .. } => "configInvalid",
             Self::Database { .. } => "databaseError",
             Self::FileSystem { .. } => "fileSystemError",
+            Self::EnvironmentFile { .. } => "environmentFileInvalid",
             Self::CommandFailed { .. } => "commandFailed",
             Self::CommandTimedOut { .. } => "commandTimedOut",
             Self::HealthCheck { .. } => "healthCheckFailed",
@@ -79,6 +98,10 @@ impl AppError {
             Self::RequestTooLarge { .. } => "requestTooLarge",
             Self::Authentication { .. } => "authenticationFailed",
             Self::ProjectNotFound { .. } => "projectNotFound",
+            Self::ProjectStopped { .. } => "projectStopped",
+            Self::ProjectBlocked { .. } => "projectBlocked",
+            Self::ProjectMustBeStopped { .. } => "projectMustBeStopped",
+            Self::ProjectDeploymentActive { .. } => "projectDeploymentActive",
             Self::DeploymentNotFound { .. } => "deploymentNotFound",
             Self::DeploymentNotRetryable { .. } => "deploymentNotRetryable",
             Self::ReleaseNotFound { .. } => "releaseNotFound",
@@ -97,9 +120,14 @@ impl AppError {
             | Self::Config { .. }
             | Self::DeploymentNotRetryable { .. } => StatusCode::BAD_REQUEST,
             Self::RequestTooLarge { .. } => StatusCode::PAYLOAD_TOO_LARGE,
-            Self::InvalidState { .. } => StatusCode::CONFLICT,
+            Self::ProjectStopped { .. }
+            | Self::ProjectBlocked { .. }
+            | Self::ProjectMustBeStopped { .. }
+            | Self::ProjectDeploymentActive { .. }
+            | Self::InvalidState { .. } => StatusCode::CONFLICT,
             Self::Database { .. }
             | Self::FileSystem { .. }
+            | Self::EnvironmentFile { .. }
             | Self::CommandFailed { .. }
             | Self::CommandTimedOut { .. }
             | Self::HealthCheck { .. }

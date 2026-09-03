@@ -17,7 +17,7 @@ use crate::config::{LoadedConfig, load_config};
 use crate::db::Database;
 use crate::deploy::{Deployer, run_worker};
 use crate::error::{AppError, file_error};
-use crate::model::{Deployment, ProjectState};
+use crate::model::{Deployment, ProjectState, ProjectStatus};
 use crate::web::{AppState, router};
 
 #[derive(Debug, Parser)]
@@ -43,6 +43,12 @@ enum Command {
     List,
     #[command(about = "Show deployment status for a project")]
     Status(ProjectArgs),
+    #[command(about = "Stop accepting and processing deployments for a project")]
+    Stop(ProjectArgs),
+    #[command(about = "Resume accepting and processing deployments for a project")]
+    Start(ProjectArgs),
+    #[command(about = "Delete a stopped deployment project while preserving its releases")]
+    Delete(ProjectArgs),
     #[command(about = "Retry a failed deployment")]
     Retry(RetryArgs),
     #[command(about = "Roll back to a successful release")]
@@ -124,6 +130,7 @@ struct ListedProject {
     project_id: String,
     repository_full_name: String,
     current_path: PathBuf,
+    status: ProjectStatus,
 }
 
 #[derive(Debug, Serialize)]
@@ -154,6 +161,15 @@ struct DeploymentOutput {
 struct ProjectOutput {
     ok: bool,
     project: ProjectState,
+}
+
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct DeleteProjectOutput {
+    ok: bool,
+    project_id: String,
+    project_config_path: PathBuf,
+    current_path: PathBuf,
 }
 
 #[derive(Debug, Serialize)]
@@ -239,8 +255,11 @@ async fn run(cli: Cli) -> Result<(), AppError> {
             args.deployment_type,
             args.current_path.as_deref(),
         ),
-        Command::List => list_projects(&resolve_config_path()?),
+        Command::List => list_projects(&resolve_config_path()?).await,
         Command::Status(args) => status(&resolve_config_path()?, &args.project_id).await,
+        Command::Stop(args) => stop(&resolve_config_path()?, &args.project_id).await,
+        Command::Start(args) => start(&resolve_config_path()?, &args.project_id).await,
+        Command::Delete(args) => delete(&resolve_config_path()?, &args.project_id).await,
         Command::Retry(args) => retry(&resolve_config_path()?, &args.deployment_id).await,
         Command::Rollback(args) => {
             rollback(&resolve_config_path()?, &args.project_id, &args.commit_sha).await
@@ -421,17 +440,18 @@ fn remove_failed_project_config(project_config_path: &Path, source: AppError) ->
     }
 }
 
-fn list_projects(config_path: &Path) -> Result<(), AppError> {
-    let config = load_config(config_path)?;
-    let mut projects: Vec<ListedProject> = config
-        .projects
-        .values()
-        .map(|project| ListedProject {
+async fn list_projects(config_path: &Path) -> Result<(), AppError> {
+    let (config, database) = load_database(config_path).await?;
+    let mut projects: Vec<ListedProject> = Vec::with_capacity(config.projects.len());
+    for project in config.projects.values() {
+        let state = database.project_state(&project.project_id).await?;
+        projects.push(ListedProject {
             project_id: project.project_id.clone(),
             repository_full_name: project.repository_full_name.clone(),
             current_path: project.current_path.clone(),
-        })
-        .collect();
+            status: state.status,
+        });
+    }
     projects.sort_by(|left, right| left.project_id.cmp(&right.project_id));
     emit_json(&ListProjectsOutput { ok: true, projects })
 }
@@ -553,10 +573,10 @@ fn format_project_config(
             "type = \"static\"\nentryFile = \"index.html\"\n".to_owned()
         }
         DeploymentType::Binary => {
-            "type = \"binary\"\nbinaryPath = \"bin/my-service\"\n\n# Optional fixed-argv command after activation:\n# [reload]\n# command = [\"aynur\", \"reload\", \"my-service\", \"--update-env\"]\n".to_owned()
+            "type = \"binary\"\nbinaryPath = \"bin/my-service\"\n\n# Optional fixed-argv commands after activation and rollback:\n# [reload]\n# commands = [[\"aynur\", \"reload\", \"my-service\", \"--update-env\"]]\n".to_owned()
         }
         DeploymentType::Rust => {
-            "type = \"rust\"\ncargoManifest = \"Cargo.toml\"\npackage = \"my-service\"\nbinary = \"my-service\"\n\n# Optional fixed-argv command after activation:\n# [reload]\n# command = [\"aynur\", \"reload\", \"my-service\", \"--update-env\"]\n".to_owned()
+            "type = \"rust\"\ncargoManifest = \"Cargo.toml\"\nincludePaths = []\nbinaries = [{ package = \"my-service\", binary = \"my-service\" }]\n# environmentFile = \"/absolute/path/to/my-service.env\"\n\n# Optional fixed-argv migration command before activation:\n# [migration]\n# command = [\"./migrator\", \"migration\", \"apply\"]\n\n# Optional fixed-argv commands after activation and rollback:\n# [reload]\n# commands = [[\"aynur\", \"reload\", \"my-service\", \"--update-env\"]]\n".to_owned()
         }
     };
     let current_path = current_path
@@ -575,7 +595,7 @@ fn format_project_config(
         });
     }
     Ok(format!(
-        "projectId = \"{project_id}\"\ncurrentPath = \"{current_path}\"\nrepositoryFullName = \"owner/repository\"\nrepositoryUrl = \"https://gitee.com/owner/repository.git\"\nwebhookToken = \"{token}\"\ntagPattern = \"^deploy-[0-9]{{8}}-[0-9]{{6}}$\"\nretainReleases = 3\n\n[healthCheck]\n# Replace this with the deployed project's public URL.\nurl = \"https://example.invalid/\"\nattempts = 5\nintervalMs = 2000\ntimeoutMs = 5000\n\n[deployment]\n{deployment}"
+        "projectId = \"{project_id}\"\ncurrentPath = \"{current_path}\"\nrepositoryFullName = \"owner/repository\"\nrepositoryUrl = \"git@gitee.com:owner/repository.git\"\nwebhookToken = \"{token}\"\ntagPattern = \"^deploy-[0-9]{{8}}-[0-9]{{6}}$\"\nretainReleases = 3\n\n[healthCheck]\n# Replace this with the deployed project's public URL.\nurl = \"https://example.invalid/\"\nattempts = 5\nintervalMs = 2000\ntimeoutMs = 5000\n\n[deployment]\n{deployment}"
     ))
 }
 
@@ -612,6 +632,69 @@ async fn status(config_path: &Path, project_id: &str) -> Result<(), AppError> {
         project,
         deployments,
     })
+}
+
+async fn stop(config_path: &Path, project_id: &str) -> Result<(), AppError> {
+    let (config, database) = load_database(config_path).await?;
+    config.project(project_id)?;
+    let project = database.stop_project(project_id).await?;
+    emit_json(&ProjectOutput { ok: true, project })
+}
+
+async fn start(config_path: &Path, project_id: &str) -> Result<(), AppError> {
+    let (config, database) = load_database(config_path).await?;
+    config.project(project_id)?;
+    let project = database.start_project(project_id).await?;
+    emit_json(&ProjectOutput { ok: true, project })
+}
+
+async fn delete(config_path: &Path, project_id: &str) -> Result<(), AppError> {
+    let (config, database) = load_database(config_path).await?;
+    let project = config.project(project_id)?;
+    let project_config_path = project.config_path.clone();
+    let current_path = project.current_path.clone();
+    let staged_config_path = staged_deletion_path(&project_config_path)?;
+    fs::rename(&project_config_path, &staged_config_path).map_err(|source| {
+        file_error(
+            "stage project configuration deletion",
+            project_config_path.clone(),
+            source,
+        )
+    })?;
+    if let Err(source) = database.delete_project(project_id).await {
+        return match fs::rename(&staged_config_path, &project_config_path) {
+            Ok(()) => Err(source),
+            Err(restore_error) => Err(AppError::InvalidState {
+                reason: format!(
+                    "project deletion failed with {source}; restoring configuration {staged_config_path:?} to {project_config_path:?} also failed: {restore_error}"
+                ),
+            }),
+        };
+    }
+    fs::remove_file(&staged_config_path).map_err(|source| {
+        file_error(
+            "remove deleted project configuration",
+            staged_config_path,
+            source,
+        )
+    })?;
+    emit_json(&DeleteProjectOutput {
+        ok: true,
+        project_id: project_id.to_owned(),
+        project_config_path,
+        current_path,
+    })
+}
+
+fn staged_deletion_path(project_config_path: &Path) -> Result<PathBuf, AppError> {
+    let file_name = project_config_path
+        .file_name()
+        .ok_or_else(|| AppError::InvalidState {
+            reason: format!("project configuration {project_config_path:?} has no file name"),
+        })?;
+    let mut staged_name = file_name.to_os_string();
+    staged_name.push(format!(".deleting-{}", Uuid::now_v7().simple()));
+    Ok(project_config_path.with_file_name(staged_name))
 }
 
 async fn retry(config_path: &Path, deployment_id: &str) -> Result<(), AppError> {

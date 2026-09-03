@@ -4,7 +4,7 @@ use std::time::Duration;
 
 use chrono::{SecondsFormat, Utc};
 use sqlx::sqlite::{SqliteConnectOptions, SqliteJournalMode, SqlitePoolOptions, SqliteSynchronous};
-use sqlx::{Sqlite, SqlitePool, Transaction};
+use sqlx::{AssertSqlSafe, Sqlite, SqlitePool, Transaction};
 use uuid::Uuid;
 
 use crate::error::{AppError, file_error};
@@ -54,6 +54,7 @@ impl Database {
             r#"
             CREATE TABLE IF NOT EXISTS project_state (
                 project_id TEXT PRIMARY KEY NOT NULL,
+                stopped INTEGER NOT NULL DEFAULT 0 CHECK (stopped IN (0, 1)),
                 blocked INTEGER NOT NULL CHECK (blocked IN (0, 1)),
                 blocked_reason TEXT,
                 updated_at TEXT NOT NULL
@@ -62,35 +63,95 @@ impl Database {
         )
         .execute(&self.pool)
         .await?;
+        let schema_version: i64 = sqlx::query_scalar("PRAGMA user_version")
+            .fetch_one(&self.pool)
+            .await?;
+        let deployments_table_exists: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM sqlite_master WHERE type = 'table' AND name = 'deployments'",
+        )
+        .fetch_one(&self.pool)
+        .await?;
+        match (schema_version, deployments_table_exists) {
+            (0, 0) => self.create_schema_v2().await?,
+            (0, 1) => {
+                self.migrate_schema_v0_to_v1().await?;
+                self.migrate_schema_v1_to_v2().await?;
+            }
+            (1, 1) => self.migrate_schema_v1_to_v2().await?,
+            (2, 1) => {}
+            (version, table_count) => {
+                return Err(AppError::InvalidState {
+                    reason: format!(
+                        "unsupported deployment database schema version {version} with deployments table count {table_count}"
+                    ),
+                });
+            }
+        }
+        self.create_deployment_indexes().await?;
+        Ok(())
+    }
+
+    async fn create_schema_v2(&self) -> Result<(), AppError> {
+        let statement = create_deployments_table_sql("deployments")?;
+        sqlx::query(AssertSqlSafe(statement))
+            .execute(&self.pool)
+            .await?;
+        sqlx::query("PRAGMA user_version = 2")
+            .execute(&self.pool)
+            .await?;
+        Ok(())
+    }
+
+    async fn migrate_schema_v0_to_v1(&self) -> Result<(), AppError> {
+        let mut transaction = self.pool.begin().await?;
+        let statement = create_deployments_table_sql("deployments_v1")?;
+        sqlx::query(AssertSqlSafe(statement))
+            .execute(&mut *transaction)
+            .await?;
         sqlx::query(
             r#"
-            CREATE TABLE IF NOT EXISTS deployments (
-                id TEXT PRIMARY KEY NOT NULL,
-                project_id TEXT NOT NULL,
-                event_key TEXT NOT NULL UNIQUE,
-                kind TEXT NOT NULL CHECK (kind IN ('deploy', 'rollback')),
-                tag TEXT NOT NULL,
-                requested_sha TEXT NOT NULL,
-                commit_sha TEXT,
-                release_path TEXT,
-                previous_release_path TEXT,
-                status TEXT NOT NULL CHECK (status IN (
-                    'queued', 'fetching', 'building', 'activating', 'healthChecking',
-                    'rollingBack', 'succeeded', 'failed', 'rollbackFailed'
-                )),
-                error_code TEXT,
-                error_message TEXT,
-                retry_of TEXT,
-                created_at TEXT NOT NULL,
-                updated_at TEXT NOT NULL,
-                completed_at TEXT,
-                FOREIGN KEY (project_id) REFERENCES project_state(project_id),
-                FOREIGN KEY (retry_of) REFERENCES deployments(id)
-            ) STRICT
+            INSERT INTO deployments_v1(
+                id, project_id, event_key, kind, tag, requested_sha, commit_sha,
+                release_path, previous_release_path, status, error_code, error_message,
+                retry_of, created_at, updated_at, completed_at
+            )
+            SELECT
+                id, project_id, event_key, kind, tag, requested_sha, commit_sha,
+                release_path, previous_release_path, status, error_code, error_message,
+                retry_of, created_at, updated_at, completed_at
+            FROM deployments
             "#,
         )
-        .execute(&self.pool)
+        .execute(&mut *transaction)
         .await?;
+        sqlx::query("DROP TABLE deployments")
+            .execute(&mut *transaction)
+            .await?;
+        sqlx::query("ALTER TABLE deployments_v1 RENAME TO deployments")
+            .execute(&mut *transaction)
+            .await?;
+        sqlx::query("PRAGMA user_version = 1")
+            .execute(&mut *transaction)
+            .await?;
+        transaction.commit().await?;
+        Ok(())
+    }
+
+    async fn migrate_schema_v1_to_v2(&self) -> Result<(), AppError> {
+        let mut transaction = self.pool.begin().await?;
+        sqlx::query(
+            "ALTER TABLE project_state ADD COLUMN stopped INTEGER NOT NULL DEFAULT 0 CHECK (stopped IN (0, 1))",
+        )
+        .execute(&mut *transaction)
+        .await?;
+        sqlx::query("PRAGMA user_version = 2")
+            .execute(&mut *transaction)
+            .await?;
+        transaction.commit().await?;
+        Ok(())
+    }
+
+    async fn create_deployment_indexes(&self) -> Result<(), AppError> {
         sqlx::query(
             r#"
             CREATE INDEX IF NOT EXISTS deployments_queue_idx
@@ -119,8 +180,9 @@ impl Database {
         for project_id in project_ids {
             sqlx::query(
                 r#"
-                INSERT INTO project_state(project_id, blocked, blocked_reason, updated_at)
-                VALUES (?, 0, NULL, ?)
+                INSERT INTO project_state(
+                    project_id, stopped, blocked, blocked_reason, updated_at
+                ) VALUES (?, 0, 0, NULL, ?)
                 ON CONFLICT(project_id) DO NOTHING
                 "#,
             )
@@ -157,7 +219,10 @@ impl Database {
             r#"
             INSERT INTO deployments(
                 id, project_id, event_key, kind, tag, requested_sha, status, created_at, updated_at
-            ) VALUES (?, ?, ?, 'deploy', ?, ?, 'queued', ?, ?)
+            )
+            SELECT ?, ?, ?, 'deploy', ?, ?, 'queued', ?, ?
+            FROM project_state
+            WHERE project_id = ? AND stopped = 0
             ON CONFLICT(event_key) DO NOTHING
             "#,
         )
@@ -168,9 +233,26 @@ impl Database {
         .bind(requested_sha)
         .bind(&now)
         .bind(&now)
+        .bind(project_id)
         .execute(&mut *transaction)
         .await?;
         let created = result.rows_affected() == 1;
+        if !created {
+            let project = sqlx::query_as::<_, ProjectStateRow>(
+                "SELECT * FROM project_state WHERE project_id = ?",
+            )
+            .bind(project_id)
+            .fetch_optional(&mut *transaction)
+            .await?
+            .ok_or_else(|| AppError::ProjectNotFound {
+                project_id: project_id.to_owned(),
+            })?;
+            if project.stopped != 0 {
+                return Err(AppError::ProjectStopped {
+                    project_id: project_id.to_owned(),
+                });
+            }
+        }
         let row = fetch_by_event_key(&mut transaction, event_key).await?;
         transaction.commit().await?;
         Ok(CreatedDeployment {
@@ -277,16 +359,25 @@ impl Database {
     pub async fn next_pending(&self) -> Result<Option<Deployment>, AppError> {
         let row = sqlx::query_as::<_, DeploymentRow>(
             r#"
-            SELECT d.*
-            FROM deployments d
-            JOIN project_state p ON p.project_id = d.project_id
-            WHERE d.status IN (
-                'queued', 'fetching', 'building', 'activating', 'healthChecking', 'rollingBack'
-            ) AND p.blocked = 0
-            ORDER BY d.created_at ASC, d.id ASC
-            LIMIT 1
+            UPDATE deployments
+            SET
+                status = CASE WHEN status = 'queued' THEN 'fetching' ELSE status END,
+                updated_at = CASE WHEN status = 'queued' THEN ? ELSE updated_at END
+            WHERE id = (
+                SELECT d.id
+                FROM deployments d
+                JOIN project_state p ON p.project_id = d.project_id
+                WHERE d.status IN (
+                    'queued', 'fetching', 'building', 'migrating', 'activating',
+                    'healthChecking', 'rollingBack'
+                ) AND p.stopped = 0 AND p.blocked = 0
+                ORDER BY d.created_at ASC, d.id ASC
+                LIMIT 1
+            )
+            RETURNING *
             "#,
         )
+        .bind(now())
         .fetch_optional(&self.pool)
         .await?;
         row.map(Deployment::try_from).transpose()
@@ -316,6 +407,93 @@ impl Database {
             project_id: project_id.to_owned(),
         })?;
         Ok(row.into())
+    }
+
+    pub async fn stop_project(&self, project_id: &str) -> Result<ProjectState, AppError> {
+        let now = now();
+        update_project_exactly_one(
+            sqlx::query(
+                "UPDATE project_state SET stopped = 1, updated_at = ? WHERE project_id = ?",
+            )
+            .bind(now)
+            .bind(project_id)
+            .execute(&self.pool)
+            .await?
+            .rows_affected(),
+            project_id,
+        )?;
+        self.project_state(project_id).await
+    }
+
+    pub async fn start_project(&self, project_id: &str) -> Result<ProjectState, AppError> {
+        let now = now();
+        let result = sqlx::query(
+            "UPDATE project_state SET stopped = 0, updated_at = ? WHERE project_id = ? AND blocked = 0",
+        )
+        .bind(now)
+        .bind(project_id)
+        .execute(&self.pool)
+        .await?;
+        if result.rows_affected() == 0 {
+            let project = self.project_state(project_id).await?;
+            return Err(AppError::ProjectBlocked {
+                project_id: project_id.to_owned(),
+                reason: project
+                    .blocked_reason
+                    .unwrap_or_else(|| "no blocked reason was recorded".to_owned()),
+            });
+        }
+        self.project_state(project_id).await
+    }
+
+    pub async fn delete_project(&self, project_id: &str) -> Result<(), AppError> {
+        let mut transaction = self.pool.begin().await?;
+        let project = sqlx::query_as::<_, ProjectStateRow>(
+            "SELECT * FROM project_state WHERE project_id = ?",
+        )
+        .bind(project_id)
+        .fetch_optional(&mut *transaction)
+        .await?
+        .ok_or_else(|| AppError::ProjectNotFound {
+            project_id: project_id.to_owned(),
+        })?;
+        if project.stopped == 0 {
+            return Err(AppError::ProjectMustBeStopped {
+                project_id: project_id.to_owned(),
+            });
+        }
+        let active = sqlx::query_as::<_, DeploymentRow>(
+            r#"
+            SELECT * FROM deployments
+            WHERE project_id = ? AND status IN (
+                'fetching', 'building', 'migrating', 'activating',
+                'healthChecking', 'rollingBack'
+            )
+            ORDER BY created_at ASC, id ASC
+            LIMIT 1
+            "#,
+        )
+        .bind(project_id)
+        .fetch_optional(&mut *transaction)
+        .await?;
+        if let Some(row) = active {
+            let deployment = Deployment::try_from(row)?;
+            return Err(AppError::ProjectDeploymentActive {
+                project_id: project_id.to_owned(),
+                deployment_id: deployment.id,
+                status: deployment.status.to_string(),
+            });
+        }
+        sqlx::query("DELETE FROM deployments WHERE project_id = ?")
+            .bind(project_id)
+            .execute(&mut *transaction)
+            .await?;
+        sqlx::query("DELETE FROM project_state WHERE project_id = ?")
+            .bind(project_id)
+            .execute(&mut *transaction)
+            .await?;
+        transaction.commit().await?;
+        Ok(())
     }
 
     pub async fn set_status(
@@ -542,6 +720,41 @@ impl Database {
         .await?;
         Ok(paths)
     }
+}
+
+fn create_deployments_table_sql(table_name: &str) -> Result<String, AppError> {
+    if !matches!(table_name, "deployments" | "deployments_v1") {
+        return Err(AppError::InvalidState {
+            reason: format!("unsupported internal deployments table name {table_name:?}"),
+        });
+    }
+    Ok(format!(
+        r#"
+        CREATE TABLE {table_name} (
+            id TEXT PRIMARY KEY NOT NULL,
+            project_id TEXT NOT NULL,
+            event_key TEXT NOT NULL UNIQUE,
+            kind TEXT NOT NULL CHECK (kind IN ('deploy', 'rollback')),
+            tag TEXT NOT NULL,
+            requested_sha TEXT NOT NULL,
+            commit_sha TEXT,
+            release_path TEXT,
+            previous_release_path TEXT,
+            status TEXT NOT NULL CHECK (status IN (
+                'queued', 'fetching', 'building', 'migrating', 'activating',
+                'healthChecking', 'rollingBack', 'succeeded', 'failed', 'rollbackFailed'
+            )),
+            error_code TEXT,
+            error_message TEXT,
+            retry_of TEXT,
+            created_at TEXT NOT NULL,
+            updated_at TEXT NOT NULL,
+            completed_at TEXT,
+            FOREIGN KEY (project_id) REFERENCES project_state(project_id),
+            FOREIGN KEY (retry_of) REFERENCES {table_name}(id)
+        ) STRICT
+        "#
+    ))
 }
 
 async fn fetch_by_event_key(
