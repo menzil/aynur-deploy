@@ -8,7 +8,9 @@ use sqlx::{AssertSqlSafe, Sqlite, SqlitePool, Transaction};
 use uuid::Uuid;
 
 use crate::error::{AppError, file_error};
-use crate::model::{Deployment, DeploymentRow, DeploymentStatus, ProjectState, ProjectStateRow};
+use crate::model::{
+    CleanDeploymentType, Deployment, DeploymentRow, DeploymentStatus, ProjectState, ProjectStateRow,
+};
 
 #[derive(Clone)]
 pub struct Database {
@@ -494,6 +496,82 @@ impl Database {
             .await?;
         transaction.commit().await?;
         Ok(())
+    }
+
+    pub async fn clean_deployments(
+        &self,
+        project_id: &str,
+        keep: u64,
+        deployment_type: CleanDeploymentType,
+    ) -> Result<Vec<Deployment>, AppError> {
+        let keep = i64::try_from(keep).map_err(|_| AppError::InvalidState {
+            reason: format!("clean keep value {keep} exceeds the supported SQLite integer range"),
+        })?;
+        let mut transaction = self.pool.begin().await?;
+        let project_exists: i64 =
+            sqlx::query_scalar("SELECT COUNT(*) FROM project_state WHERE project_id = ?")
+                .bind(project_id)
+                .fetch_one(&mut *transaction)
+                .await?;
+        if project_exists == 0 {
+            return Err(AppError::ProjectNotFound {
+                project_id: project_id.to_owned(),
+            });
+        }
+        let active = sqlx::query_as::<_, DeploymentRow>(
+            r#"
+            SELECT * FROM deployments
+            WHERE project_id = ? AND status IN (
+                'queued', 'fetching', 'building', 'migrating', 'activating',
+                'healthChecking', 'rollingBack'
+            )
+            ORDER BY created_at ASC, id ASC
+            LIMIT 1
+            "#,
+        )
+        .bind(project_id)
+        .fetch_optional(&mut *transaction)
+        .await?;
+        if let Some(row) = active {
+            let deployment = Deployment::try_from(row)?;
+            return Err(AppError::ProjectDeploymentActive {
+                project_id: project_id.to_owned(),
+                deployment_id: deployment.id,
+                status: deployment.status.to_string(),
+            });
+        }
+        let query = match deployment_type {
+            CleanDeploymentType::Failed => {
+                "SELECT * FROM deployments WHERE project_id = ? AND status IN ('failed', 'rollbackFailed') ORDER BY created_at DESC, id DESC LIMIT -1 OFFSET ?"
+            }
+            CleanDeploymentType::Succeeded => {
+                "SELECT * FROM deployments WHERE project_id = ? AND status = 'succeeded' ORDER BY created_at DESC, id DESC LIMIT -1 OFFSET ?"
+            }
+            CleanDeploymentType::All => {
+                "SELECT * FROM deployments WHERE project_id = ? AND status IN ('succeeded', 'failed', 'rollbackFailed') ORDER BY created_at DESC, id DESC LIMIT -1 OFFSET ?"
+            }
+        };
+        let rows = sqlx::query_as::<_, DeploymentRow>(query)
+            .bind(project_id)
+            .bind(keep)
+            .fetch_all(&mut *transaction)
+            .await?;
+        let deployments = rows
+            .into_iter()
+            .map(Deployment::try_from)
+            .collect::<Result<Vec<_>, _>>()?;
+        for deployment in &deployments {
+            sqlx::query("UPDATE deployments SET retry_of = NULL WHERE retry_of = ?")
+                .bind(&deployment.id)
+                .execute(&mut *transaction)
+                .await?;
+            sqlx::query("DELETE FROM deployments WHERE id = ?")
+                .bind(&deployment.id)
+                .execute(&mut *transaction)
+                .await?;
+        }
+        transaction.commit().await?;
+        Ok(deployments)
     }
 
     pub async fn set_status(

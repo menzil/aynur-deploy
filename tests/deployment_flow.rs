@@ -13,7 +13,7 @@ use axum::routing::get;
 use aynur_deploy::config::{LoadedConfig, load_config};
 use aynur_deploy::db::Database;
 use aynur_deploy::deploy::Deployer;
-use aynur_deploy::model::{DeploymentStatus, ProjectStatus};
+use aynur_deploy::model::{CleanDeploymentType, DeploymentStatus, ProjectStatus};
 use aynur_deploy::web::{AppState, router};
 use http_body_util::BodyExt;
 use serde_json::Value;
@@ -312,6 +312,63 @@ async fn project_deletion_requires_stop_and_no_active_deployment() {
     .await;
     assert_eq!(deleted_webhook.0, StatusCode::NOT_FOUND);
     assert_eq!(deleted_webhook.1["error"]["code"], "projectNotFound");
+}
+
+#[tokio::test]
+async fn clean_failed_deployments_keeps_latest_and_rejects_active_work() {
+    let environment = setup().await;
+    for index in 0..3 {
+        let created = environment
+            .database
+            .create_webhook_deployment(
+                PROJECT_ID,
+                &format!("event:clean-failed-{index}"),
+                &format!("deploy-20260901-12002{index}"),
+                &format!("{index:040}"),
+            )
+            .await
+            .unwrap()
+            .deployment;
+        environment.database.next_pending().await.unwrap().unwrap();
+        environment
+            .database
+            .mark_failed(&created.id, "testFailure", "test completed")
+            .await
+            .unwrap();
+    }
+
+    let removed = environment
+        .database
+        .clean_deployments(PROJECT_ID, 1, CleanDeploymentType::Failed)
+        .await
+        .unwrap();
+    assert_eq!(removed.len(), 2);
+    assert_eq!(
+        environment
+            .database
+            .deployments_for_project(PROJECT_ID)
+            .await
+            .unwrap()
+            .len(),
+        1
+    );
+
+    environment
+        .database
+        .create_webhook_deployment(
+            PROJECT_ID,
+            "event:clean-active",
+            "deploy-20260901-120030",
+            "9999999999999999999999999999999999999999",
+        )
+        .await
+        .unwrap();
+    let error = environment
+        .database
+        .clean_deployments(PROJECT_ID, 0, CleanDeploymentType::All)
+        .await
+        .expect_err("active deployment must prevent cleanup");
+    assert_eq!(error.code(), "projectDeploymentActive");
 }
 
 #[tokio::test]

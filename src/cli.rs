@@ -17,7 +17,7 @@ use crate::config::{LoadedConfig, load_config};
 use crate::db::Database;
 use crate::deploy::{Deployer, run_worker};
 use crate::error::{AppError, file_error};
-use crate::model::{Deployment, ProjectState, ProjectStatus};
+use crate::model::{CleanDeploymentType, Deployment, ProjectState, ProjectStatus};
 use crate::web::{AppState, router};
 
 #[derive(Debug, Parser)]
@@ -49,6 +49,8 @@ enum Command {
     Start(ProjectArgs),
     #[command(about = "Delete a stopped deployment project while preserving its releases")]
     Delete(ProjectArgs),
+    #[command(about = "Clean completed deployment history for a project")]
+    Clean(CleanArgs),
     #[command(about = "Retry a failed deployment")]
     Retry(RetryArgs),
     #[command(about = "Roll back to a successful release")]
@@ -79,6 +81,32 @@ enum DeploymentType {
     Static,
     Binary,
     Rust,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq, ValueEnum)]
+enum CleanType {
+    Failed,
+    Succeeded,
+    All,
+}
+
+impl From<CleanType> for CleanDeploymentType {
+    fn from(value: CleanType) -> Self {
+        match value {
+            CleanType::Failed => Self::Failed,
+            CleanType::Succeeded => Self::Succeeded,
+            CleanType::All => Self::All,
+        }
+    }
+}
+
+#[derive(Debug, Args)]
+struct CleanArgs {
+    project_id: String,
+    #[arg(long)]
+    keep: u64,
+    #[arg(long = "type", value_enum)]
+    deployment_type: CleanType,
 }
 
 #[derive(Debug, Args)]
@@ -174,6 +202,18 @@ struct DeleteProjectOutput {
 
 #[derive(Debug, Serialize)]
 #[serde(rename_all = "camelCase")]
+struct CleanOutput {
+    ok: bool,
+    project_id: String,
+    deployment_type: String,
+    keep: u64,
+    removed_deployments: usize,
+    removed_worktrees: usize,
+    removed_targets: usize,
+}
+
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
 struct ServeOutput {
     ok: bool,
     status: &'static str,
@@ -260,6 +300,7 @@ async fn run(cli: Cli) -> Result<(), AppError> {
         Command::Stop(args) => stop(&resolve_config_path()?, &args.project_id).await,
         Command::Start(args) => start(&resolve_config_path()?, &args.project_id).await,
         Command::Delete(args) => delete(&resolve_config_path()?, &args.project_id).await,
+        Command::Clean(args) => clean(&resolve_config_path()?, &args).await,
         Command::Retry(args) => retry(&resolve_config_path()?, &args.deployment_id).await,
         Command::Rollback(args) => {
             rollback(&resolve_config_path()?, &args.project_id, &args.commit_sha).await
@@ -684,6 +725,60 @@ async fn delete(config_path: &Path, project_id: &str) -> Result<(), AppError> {
         project_config_path,
         current_path,
     })
+}
+
+async fn clean(config_path: &Path, args: &CleanArgs) -> Result<(), AppError> {
+    let (config, database) = load_database(config_path).await?;
+    config.project(&args.project_id)?;
+    let deployments = database
+        .clean_deployments(&args.project_id, args.keep, args.deployment_type.into())
+        .await?;
+    let mut removed_worktrees = 0;
+    let mut removed_targets = 0;
+    for deployment in &deployments {
+        removed_worktrees += usize::from(remove_directory_if_present(
+            &config
+                .global
+                .state_directory
+                .join("worktrees")
+                .join(&deployment.id),
+        )?);
+        removed_targets += usize::from(remove_directory_if_present(
+            &config
+                .global
+                .state_directory
+                .join("targets")
+                .join(&deployment.id),
+        )?);
+    }
+    emit_json(&CleanOutput {
+        ok: true,
+        project_id: args.project_id.clone(),
+        deployment_type: match args.deployment_type {
+            CleanType::Failed => "failed",
+            CleanType::Succeeded => "succeeded",
+            CleanType::All => "all",
+        }
+        .to_owned(),
+        keep: args.keep,
+        removed_deployments: deployments.len(),
+        removed_worktrees,
+        removed_targets,
+    })
+}
+
+fn remove_directory_if_present(path: &Path) -> Result<bool, AppError> {
+    if !path.exists() {
+        return Ok(false);
+    }
+    if !path.is_dir() {
+        return Err(AppError::InvalidState {
+            reason: format!("cleanup path {path:?} exists and is not a directory"),
+        });
+    }
+    fs::remove_dir_all(path)
+        .map_err(|source| file_error("remove directory", path.to_path_buf(), source))?;
+    Ok(true)
 }
 
 fn staged_deletion_path(project_config_path: &Path) -> Result<PathBuf, AppError> {

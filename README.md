@@ -190,6 +190,7 @@ aynur-deploy list
 ```bash
 sudo systemctl enable --now aynur-deploy
 aynur-deploy status orhan-blog
+aynur-deploy clean orhan-blog --keep 20 --type failed
 ```
 
 新增项目时执行 `add`，编辑生成的 TOML 后重启服务使配置生效：
@@ -209,6 +210,10 @@ aynur-deploy retry <deploymentId>
 aynur-deploy rollback orhan-blog <commitSha>
 aynur-deploy unblock orhan-blog
 ```
+
+`clean` 只清理已经结束的部署历史和同 deployment ID 的残留 worktree/target。`--type` 必须是 `failed`、`succeeded` 或 `all`，`--keep` 指定匹配记录中保留的最新数量；存在进行中的部署时命令会拒绝执行，正式 release 不会被删除。
+
+部署命令的 stdout 和 stderr 会按行写入服务结构化日志。由 Aynur 管理服务时，可用 `aynur logs aynur-deploy` 实时查看 Cargo 的 `Compiling` 和 `Finished` 输出。
 
 `stop` 会持久化停止状态：新的 Tag WebHook 返回 `409 projectStopped`，排队任务暂停；已经开始构建、迁移或切换的任务会继续完成。`start` 恢复接收和处理，但不会解除部署失败产生的 `blocked` 状态，必须先处理故障并执行 `unblock`。
 

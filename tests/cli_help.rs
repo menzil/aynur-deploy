@@ -25,7 +25,24 @@ fn version_uses_plain_text() {
         .output()
         .expect("version command must start");
     assert!(output.status.success());
-    assert_eq!(output.stdout, b"aynur-deploy 0.4.0\n");
+    assert_eq!(output.stdout, b"aynur-deploy 0.4.1\n");
+}
+
+#[test]
+fn clean_requires_keep_and_type() {
+    let missing_keep = Command::new(env!("CARGO_BIN_EXE_aynur-deploy"))
+        .args(["clean", "project", "--type", "failed"])
+        .output()
+        .expect("clean command must start");
+    assert!(!missing_keep.status.success());
+    assert!(String::from_utf8_lossy(&missing_keep.stderr).contains("--keep"));
+
+    let missing_type = Command::new(env!("CARGO_BIN_EXE_aynur-deploy"))
+        .args(["clean", "project", "--keep", "20"])
+        .output()
+        .expect("clean command must start");
+    assert!(!missing_type.status.success());
+    assert!(String::from_utf8_lossy(&missing_type.stderr).contains("--type"));
 }
 
 #[test]
@@ -134,6 +151,13 @@ fn init_creates_private_project_config_with_generated_token() {
     let status_text = String::from_utf8(status.stdout).expect("status output must be UTF-8");
     assert!(status_text.starts_with("{\n  \"ok\": true,\n"));
     assert!(status_text.contains("\n  \"deployments\": []\n}"));
+    let status_json: Value =
+        serde_json::from_str(&status_text).expect("status output must be JSON");
+    let updated_at = status_json["project"]["updatedAt"]
+        .as_str()
+        .expect("updatedAt must be a string");
+    assert_eq!(updated_at.len(), 19);
+    assert_eq!(&updated_at[10..11], " ");
 
     let custom_current_path = latest_home.join("published/test-binary");
     for (project_id, deployment_type, current_path, expected) in [

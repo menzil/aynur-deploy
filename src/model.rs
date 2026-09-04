@@ -2,6 +2,8 @@ use std::fmt::{Display, Formatter};
 use std::path::PathBuf;
 use std::str::FromStr;
 
+use chrono::{DateTime, FixedOffset};
+use serde::Serializer;
 use serde::{Deserialize, Serialize};
 use sqlx::FromRow;
 
@@ -50,6 +52,13 @@ pub enum DeploymentStatus {
     Succeeded,
     Failed,
     RollbackFailed,
+}
+
+#[derive(Debug, Clone, Copy, Eq, PartialEq)]
+pub enum CleanDeploymentType {
+    Failed,
+    Succeeded,
+    All,
 }
 
 impl Display for DeploymentStatus {
@@ -127,8 +136,11 @@ pub struct Deployment {
     pub error_code: Option<String>,
     pub error_message: Option<String>,
     pub retry_of: Option<String>,
+    #[serde(serialize_with = "serialize_china_datetime")]
     pub created_at: String,
+    #[serde(serialize_with = "serialize_china_datetime")]
     pub updated_at: String,
+    #[serde(serialize_with = "serialize_optional_china_datetime")]
     pub completed_at: Option<String>,
 }
 
@@ -182,7 +194,38 @@ pub struct ProjectState {
     pub stopped: bool,
     pub blocked: bool,
     pub blocked_reason: Option<String>,
+    #[serde(serialize_with = "serialize_china_datetime")]
     pub updated_at: String,
+}
+
+fn serialize_china_datetime<S>(value: &str, serializer: S) -> Result<S::Ok, S::Error>
+where
+    S: Serializer,
+{
+    use serde::ser::Error;
+
+    let parsed = DateTime::parse_from_rfc3339(value).map_err(S::Error::custom)?;
+    let offset = FixedOffset::east_opt(8 * 60 * 60)
+        .ok_or_else(|| S::Error::custom("Asia/Shanghai UTC offset is invalid"))?;
+    serializer.serialize_str(
+        &parsed
+            .with_timezone(&offset)
+            .format("%Y-%m-%d %H:%M:%S")
+            .to_string(),
+    )
+}
+
+fn serialize_optional_china_datetime<S>(
+    value: &Option<String>,
+    serializer: S,
+) -> Result<S::Ok, S::Error>
+where
+    S: Serializer,
+{
+    match value {
+        Some(value) => serialize_china_datetime(value, serializer),
+        None => serializer.serialize_none(),
+    }
 }
 
 impl From<ProjectStateRow> for ProjectState {
