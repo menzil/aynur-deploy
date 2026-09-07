@@ -3,6 +3,8 @@ use std::os::unix::fs::PermissionsExt;
 use std::path::PathBuf;
 use std::process::Command;
 
+use aynur_deploy::db::Database;
+use aynur_deploy::model::DeploymentStatus;
 use serde_json::Value;
 use tempfile::tempdir;
 
@@ -48,8 +50,8 @@ fn clean_requires_keep_and_type() {
     assert!(String::from_utf8_lossy(&missing_type.stderr).contains("--type"));
 }
 
-#[test]
-fn init_creates_private_project_config_with_generated_token() {
+#[tokio::test]
+async fn init_creates_private_project_config_with_generated_token() {
     let directory = tempdir().expect("temporary home must be created");
     let xdg_config_home = directory.path().join("xdg");
     let output = Command::new(env!("CARGO_BIN_EXE_aynur-deploy"))
@@ -162,6 +164,24 @@ fn init_creates_private_project_config_with_generated_token() {
     assert_eq!(updated_at.len(), 19);
     assert_eq!(&updated_at[10..11], " ");
 
+    let database = Database::connect(&latest_home.join("state/deployments.sqlite3"))
+        .await
+        .unwrap();
+    let deployment = database
+        .create_webhook_deployment(
+            "latest-project",
+            "event:list-building",
+            "deploy-20260907-120000",
+            "0123456789abcdef0123456789abcdef01234567",
+        )
+        .await
+        .unwrap()
+        .deployment;
+    database
+        .set_status(&deployment.id, DeploymentStatus::Building)
+        .await
+        .unwrap();
+
     let custom_current_path = latest_home.join("published/test-binary");
     for (project_id, deployment_type, current_path, expected) in [
         (
@@ -217,7 +237,7 @@ fn init_creates_private_project_config_with_generated_token() {
     let list_json: Value = serde_json::from_slice(&list.stdout).expect("list output must be JSON");
     assert_eq!(list_json["ok"], true);
     assert_eq!(list_json["projects"][0]["projectId"], "latest-project");
-    assert_eq!(list_json["projects"][0]["status"], "running");
+    assert_eq!(list_json["projects"][0]["status"], "running: building");
     assert_eq!(list_json["projects"][1]["projectId"], "test-binary");
     assert_eq!(
         list_json["projects"][1]["currentPath"],

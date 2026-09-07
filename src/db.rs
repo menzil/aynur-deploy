@@ -398,6 +398,27 @@ impl Database {
         rows.into_iter().map(Deployment::try_from).collect()
     }
 
+    pub async fn current_deployment_status(
+        &self,
+        project_id: &str,
+    ) -> Result<Option<DeploymentStatus>, AppError> {
+        let status = sqlx::query_scalar::<_, String>(
+            r#"
+            SELECT status FROM deployments
+            WHERE project_id = ? AND status IN (
+                'queued', 'fetching', 'building', 'migrating', 'activating',
+                'healthChecking', 'rollingBack'
+            )
+            ORDER BY created_at ASC, id ASC
+            LIMIT 1
+            "#,
+        )
+        .bind(project_id)
+        .fetch_optional(&self.pool)
+        .await?;
+        status.map(|value| value.parse()).transpose()
+    }
+
     pub async fn project_state(&self, project_id: &str) -> Result<ProjectState, AppError> {
         let row = sqlx::query_as::<_, ProjectStateRow>(
             "SELECT * FROM project_state WHERE project_id = ?",

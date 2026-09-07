@@ -179,7 +179,7 @@ aynur-deploy check
 aynur-deploy serve
 ```
 
-查看当前配置的所有部署项目、运行状态及其发布路径：
+查看当前配置的所有部署项目、运行状态及其发布路径。运行中的项目存在发布任务时，`status` 会附带当前阶段，例如 `running: building`：
 
 ```bash
 aynur-deploy list

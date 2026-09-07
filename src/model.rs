@@ -186,6 +186,16 @@ pub enum ProjectStatus {
     Blocked,
 }
 
+impl Display for ProjectStatus {
+    fn fmt(&self, formatter: &mut Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str(match self {
+            Self::Running => "running",
+            Self::Stopped => "stopped",
+            Self::Blocked => "blocked",
+        })
+    }
+}
+
 #[derive(Debug, Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct ProjectState {

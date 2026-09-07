@@ -158,7 +158,7 @@ struct ListedProject {
     project_id: String,
     repository_full_name: String,
     current_path: PathBuf,
-    status: ProjectStatus,
+    status: String,
 }
 
 #[derive(Debug, Serialize)]
@@ -486,11 +486,22 @@ async fn list_projects(config_path: &Path) -> Result<(), AppError> {
     let mut projects: Vec<ListedProject> = Vec::with_capacity(config.projects.len());
     for project in config.projects.values() {
         let state = database.project_state(&project.project_id).await?;
+        let status = if state.status == ProjectStatus::Running {
+            match database
+                .current_deployment_status(&project.project_id)
+                .await?
+            {
+                Some(deployment_status) => format!("{}: {deployment_status}", state.status),
+                None => state.status.to_string(),
+            }
+        } else {
+            state.status.to_string()
+        };
         projects.push(ListedProject {
             project_id: project.project_id.clone(),
             repository_full_name: project.repository_full_name.clone(),
             current_path: project.current_path.clone(),
-            status: state.status,
+            status,
         });
     }
     projects.sort_by(|left, right| left.project_id.cmp(&right.project_id));
