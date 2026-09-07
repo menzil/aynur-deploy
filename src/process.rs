@@ -1,12 +1,18 @@
+use std::collections::VecDeque;
 use std::ffi::OsString;
-use std::path::PathBuf;
+use std::io;
+use std::path::{Path, PathBuf};
 use std::process::Stdio;
 use std::time::Duration;
 
-use tokio::io::{AsyncBufReadExt, AsyncRead, BufReader};
+use tokio::io::{AsyncRead, AsyncReadExt};
 use tokio::process::Command;
 
 use crate::error::AppError;
+
+const OUTPUT_CAPTURE_BYTES: usize = 64 * 1024;
+const LOG_LINE_BYTES: usize = 8 * 1024;
+const OUTPUT_TRUNCATED_MARKER: &str = "[... earlier command output truncated ...]\n";
 
 #[derive(Debug, Clone)]
 pub struct CommandSpec {
@@ -96,20 +102,117 @@ pub async fn run_command(
 }
 
 async fn read_stream<R>(
-    reader: R,
+    mut reader: R,
     program: PathBuf,
     stream: &'static str,
 ) -> std::io::Result<String>
 where
     R: AsyncRead + Unpin,
 {
-    let mut lines = BufReader::new(reader).lines();
-    let mut output = Vec::new();
-    while let Some(line) = lines.next_line().await? {
-        tracing::info!(program = %program.display(), stream, line = %line, "command output");
-        output.push(line);
+    let mut capture = VecDeque::with_capacity(OUTPUT_CAPTURE_BYTES);
+    let mut line = Vec::with_capacity(LOG_LINE_BYTES);
+    let mut line_truncated = false;
+    let mut output_truncated = false;
+    let mut chunk = [0_u8; 8 * 1024];
+
+    loop {
+        let bytes_read = reader.read(&mut chunk).await?;
+        if bytes_read == 0 {
+            break;
+        }
+        let chunk = &chunk[..bytes_read];
+        append_tail(&mut capture, chunk, &mut output_truncated);
+        log_lines(chunk, &mut line, &mut line_truncated, &program, stream)?;
     }
-    Ok(output.join("\n"))
+    log_final_line(&line, line_truncated, &program, stream)?;
+
+    let bytes: Vec<u8> = capture.into();
+    let output = decode_capture(&bytes, output_truncated)?;
+    if output_truncated {
+        Ok(format!("{OUTPUT_TRUNCATED_MARKER}{output}"))
+    } else {
+        Ok(output)
+    }
+}
+
+fn decode_capture(bytes: &[u8], truncated: bool) -> io::Result<String> {
+    let mut bytes = bytes;
+    if truncated {
+        while let Err(source) = std::str::from_utf8(bytes) {
+            if source.valid_up_to() != 0 {
+                return Err(io::Error::new(io::ErrorKind::InvalidData, source));
+            }
+            bytes = &bytes[1..];
+        }
+    }
+    let output = std::str::from_utf8(bytes)
+        .map_err(|source| io::Error::new(io::ErrorKind::InvalidData, source))?;
+    Ok(output.lines().collect::<Vec<_>>().join("\n"))
+}
+
+fn append_tail(capture: &mut VecDeque<u8>, chunk: &[u8], truncated: &mut bool) {
+    if chunk.len() >= OUTPUT_CAPTURE_BYTES {
+        capture.clear();
+        capture.extend(&chunk[chunk.len() - OUTPUT_CAPTURE_BYTES..]);
+        *truncated = true;
+        return;
+    }
+    let overflow = capture
+        .len()
+        .saturating_add(chunk.len())
+        .saturating_sub(OUTPUT_CAPTURE_BYTES);
+    if overflow > 0 {
+        capture.drain(..overflow);
+        *truncated = true;
+    }
+    capture.extend(chunk);
+}
+
+fn log_lines(
+    chunk: &[u8],
+    line: &mut Vec<u8>,
+    line_truncated: &mut bool,
+    program: &Path,
+    stream: &'static str,
+) -> io::Result<()> {
+    for &byte in chunk {
+        if byte == b'\n' {
+            log_line(line, *line_truncated, program, stream)?;
+            line.clear();
+            *line_truncated = false;
+        } else if line.len() < LOG_LINE_BYTES {
+            line.push(byte);
+        } else {
+            *line_truncated = true;
+        }
+    }
+    Ok(())
+}
+
+fn log_final_line(
+    line: &[u8],
+    truncated: bool,
+    program: &Path,
+    stream: &'static str,
+) -> io::Result<()> {
+    if !line.is_empty() || truncated {
+        log_line(line, truncated, program, stream)?;
+    }
+    Ok(())
+}
+
+fn log_line(line: &[u8], truncated: bool, program: &Path, stream: &'static str) -> io::Result<()> {
+    let line = line.strip_suffix(b"\r").unwrap_or(line);
+    let line = std::str::from_utf8(line)
+        .map_err(|source| io::Error::new(io::ErrorKind::InvalidData, source))?;
+    tracing::info!(
+        program = %program.display(),
+        stream,
+        line,
+        truncated,
+        "command output"
+    );
+    Ok(())
 }
 
 async fn join_stream(
@@ -131,4 +234,36 @@ async fn join_stream(
             stdout: String::new(),
             stderr: format!("failed to read {stream}: {source}"),
         })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use tokio::io::AsyncWriteExt;
+
+    #[tokio::test]
+    async fn command_output_capture_keeps_only_a_bounded_tail() {
+        let (mut writer, reader) = tokio::io::duplex(8 * 1024);
+        let reader_task =
+            tokio::spawn(read_stream(reader, PathBuf::from("test-command"), "stdout"));
+        let payload = vec![b'x'; OUTPUT_CAPTURE_BYTES * 4];
+        writer.write_all(&payload).await.unwrap();
+        writer.write_all(b"\ntail").await.unwrap();
+        drop(writer);
+
+        let output = reader_task.await.unwrap().unwrap();
+        assert!(output.starts_with(OUTPUT_TRUNCATED_MARKER));
+        assert!(output.ends_with("tail"));
+        assert!(output.len() <= OUTPUT_CAPTURE_BYTES + OUTPUT_TRUNCATED_MARKER.len());
+    }
+
+    #[tokio::test]
+    async fn command_output_capture_preserves_small_line_output() {
+        let input = b"first\r\nsecond\n";
+        let output = read_stream(&input[..], PathBuf::from("test-command"), "stderr")
+            .await
+            .unwrap();
+
+        assert_eq!(output, "first\nsecond");
+    }
 }
