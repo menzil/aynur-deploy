@@ -25,7 +25,10 @@ fn version_uses_plain_text() {
         .output()
         .expect("version command must start");
     assert!(output.status.success());
-    assert_eq!(output.stdout, b"aynur-deploy 0.4.1\n");
+    assert_eq!(
+        String::from_utf8(output.stdout).expect("version output must be UTF-8"),
+        format!("aynur-deploy {}\n", env!("CARGO_PKG_VERSION"))
+    );
 }
 
 #[test]
