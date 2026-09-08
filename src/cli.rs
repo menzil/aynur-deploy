@@ -1,7 +1,8 @@
 use std::env;
+use std::fmt::Write;
 use std::fs::{self, OpenOptions};
 use std::future::IntoFuture;
-use std::io::{self, Write};
+use std::io::{self, IsTerminal, Write as IoWrite};
 use std::os::unix::fs::{PermissionsExt, symlink};
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
@@ -17,7 +18,7 @@ use crate::config::{LoadedConfig, load_config};
 use crate::db::Database;
 use crate::deploy::{Deployer, run_worker};
 use crate::error::{AppError, file_error};
-use crate::model::{CleanDeploymentType, Deployment, ProjectState, ProjectStatus};
+use crate::model::{CleanDeploymentType, Deployment, DeploymentStatus, ProjectState, ProjectStatus};
 use crate::web::{AppState, router};
 
 #[derive(Debug, Parser)]
@@ -159,7 +160,62 @@ struct ListedProject {
     repository_full_name: String,
     current_path: PathBuf,
     status: String,
+    #[serde(skip)]
+    status_kind: ListedProjectStatus,
 }
+
+#[derive(Debug, Clone, Copy)]
+enum ListedProjectStatus {
+    Running { deployment_status: Option<DeploymentStatus> },
+    Stopped,
+    Blocked,
+}
+
+impl ListedProjectStatus {
+    fn from_state(status: ProjectStatus, deployment_status: Option<DeploymentStatus>) -> Self {
+        match status {
+            ProjectStatus::Running => Self::Running { deployment_status },
+            ProjectStatus::Stopped => Self::Stopped,
+            ProjectStatus::Blocked => Self::Blocked,
+        }
+    }
+
+    fn color_code(self) -> &'static str {
+        match self {
+            Self::Running {
+                deployment_status: Some(DeploymentStatus::Failed | DeploymentStatus::RollbackFailed),
+            }
+            | Self::Blocked => ANSI_RED,
+            Self::Running {
+                deployment_status: Some(DeploymentStatus::RollingBack),
+            } => ANSI_MAGENTA,
+            Self::Running {
+                deployment_status: Some(
+                    DeploymentStatus::Queued
+                    | DeploymentStatus::Fetching
+                    | DeploymentStatus::Building
+                    | DeploymentStatus::Migrating
+                    | DeploymentStatus::Activating
+                    | DeploymentStatus::HealthChecking,
+                ),
+            } => ANSI_YELLOW,
+            Self::Running { deployment_status: Some(DeploymentStatus::Succeeded) } => ANSI_GREEN,
+            Self::Running { deployment_status: None } => ANSI_GREEN,
+            Self::Stopped => ANSI_DIM,
+        }
+    }
+
+    fn colorize(self, value: &str) -> String {
+        format!("{}{}{}", self.color_code(), value, ANSI_RESET)
+    }
+}
+
+const ANSI_RESET: &str = "\x1b[0m";
+const ANSI_RED: &str = "\x1b[31m";
+const ANSI_GREEN: &str = "\x1b[32m";
+const ANSI_YELLOW: &str = "\x1b[33m";
+const ANSI_MAGENTA: &str = "\x1b[35m";
+const ANSI_DIM: &str = "\x1b[2m";
 
 #[derive(Debug, Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -486,11 +542,13 @@ async fn list_projects(config_path: &Path) -> Result<(), AppError> {
     let mut projects: Vec<ListedProject> = Vec::with_capacity(config.projects.len());
     for project in config.projects.values() {
         let state = database.project_state(&project.project_id).await?;
+        let deployment_status = if state.status == ProjectStatus::Running {
+            database.current_deployment_status(&project.project_id).await?
+        } else {
+            None
+        };
         let status = if state.status == ProjectStatus::Running {
-            match database
-                .current_deployment_status(&project.project_id)
-                .await?
-            {
+            match deployment_status {
                 Some(deployment_status) => format!("{}: {deployment_status}", state.status),
                 None => state.status.to_string(),
             }
@@ -502,10 +560,16 @@ async fn list_projects(config_path: &Path) -> Result<(), AppError> {
             repository_full_name: project.repository_full_name.clone(),
             current_path: project.current_path.clone(),
             status,
+            status_kind: ListedProjectStatus::from_state(state.status, deployment_status),
         });
     }
     projects.sort_by(|left, right| left.project_id.cmp(&right.project_id));
-    emit_json(&ListProjectsOutput { ok: true, projects })
+
+    if io::stdout().is_terminal() {
+        emit_text_stdout(&render_project_list(&projects))
+    } else {
+        emit_json(&ListProjectsOutput { ok: true, projects })
+    }
 }
 
 fn resolve_config_path() -> Result<PathBuf, AppError> {
@@ -955,6 +1019,29 @@ fn validate_cli_sha(value: &str) -> Result<(), AppError> {
         });
     }
     Ok(())
+}
+
+fn render_project_list(projects: &[ListedProject]) -> String {
+    let mut output = String::new();
+    let _ = writeln!(
+        output,
+        "{:<20}  {:<28}  {:<12}  STATUS",
+        "PROJECT ID",
+        "REPOSITORY",
+        "PATH"
+    );
+    let _ = writeln!(output, "{}", "-".repeat(20 + 2 + 28 + 2 + 12 + 2 + 6));
+    for project in projects {
+        let _ = writeln!(
+            output,
+            "{:<20}  {:<28}  {:<12}  {}",
+            project.project_id,
+            project.repository_full_name,
+            project.current_path.display(),
+            project.status_kind.colorize(&project.status)
+        );
+    }
+    output
 }
 
 fn emit_json<T: Serialize>(value: &T) -> Result<(), AppError> {
