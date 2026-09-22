@@ -185,6 +185,14 @@ aynur-deploy serve
 aynur-deploy list
 ```
 
+`list` 按项目名排序，每个项目的 `index` 字段是从 1 开始的序号。可使用序号查看详情，省去输入完整项目名：
+
+```bash
+aynur-deploy status 1
+```
+
+`status` 同时支持完整项目名；数字项目名优先于序号匹配。序号按当前配置计算，增删项目后可能变化，不应作为脚本中的固定标识。其他运维命令仍使用项目名。
+
 生产环境也可以让 systemd 运行同一个 `serve` 命令：
 
 ```bash
@@ -192,6 +200,8 @@ sudo systemctl enable --now aynur-deploy
 aynur-deploy status orhan-blog
 aynur-deploy clean orhan-blog --keep 20 --type failed
 ```
+
+`status` 的部署记录按创建时间从旧到新显示，最新记录在最下面。
 
 新增项目时执行 `add`，编辑生成的 TOML 后重启服务使配置生效：
 

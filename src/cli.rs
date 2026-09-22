@@ -41,7 +41,7 @@ enum Command {
     Add(AddArgs),
     #[command(about = "List configured deployment projects")]
     List,
-    #[command(about = "Show deployment status for a project")]
+    #[command(about = "Show deployment status by project name or list index (names take precedence)")]
     Status(ProjectArgs),
     #[command(about = "Stop accepting and processing deployments for a project")]
     Stop(ProjectArgs),
@@ -155,6 +155,7 @@ struct ListProjectsOutput {
 #[derive(Debug, Serialize)]
 #[serde(rename_all = "camelCase")]
 struct ListedProject {
+    index: usize,
     project_id: String,
     repository_full_name: String,
     current_path: PathBuf,
@@ -485,7 +486,9 @@ fn remove_failed_project_config(project_config_path: &Path, source: AppError) ->
 async fn list_projects(config_path: &Path) -> Result<(), AppError> {
     let (config, database) = load_database(config_path).await?;
     let mut projects: Vec<ListedProject> = Vec::with_capacity(config.projects.len());
-    for project in config.projects.values() {
+    let mut configured_projects: Vec<_> = config.projects.values().collect();
+    configured_projects.sort_unstable_by(|left, right| left.project_id.cmp(&right.project_id));
+    for (index, project) in configured_projects.into_iter().enumerate() {
         let state = database.project_state(&project.project_id).await?;
         let status = if state.status == ProjectStatus::Running {
             match database
@@ -499,13 +502,13 @@ async fn list_projects(config_path: &Path) -> Result<(), AppError> {
             state.status.to_string()
         };
         projects.push(ListedProject {
+            index: index + 1,
             project_id: project.project_id.clone(),
             repository_full_name: project.repository_full_name.clone(),
             current_path: project.current_path.clone(),
             status,
         });
     }
-    projects.sort_by(|left, right| left.project_id.cmp(&right.project_id));
     emit_json(&ListProjectsOutput { ok: true, projects })
 }
 
@@ -677,9 +680,26 @@ fn check_config(config_path: &Path) -> Result<(), AppError> {
 
 async fn status(config_path: &Path, project_id: &str) -> Result<(), AppError> {
     let (config, database) = load_database(config_path).await?;
-    config.project(project_id)?;
+    let selected_project = match config.projects.get(project_id) {
+        Some(project) => project,
+        None => {
+            let index = project_id
+                .parse::<usize>()
+                .ok()
+                .and_then(|index| index.checked_sub(1))
+                .filter(|&index| index < config.projects.len())
+                .ok_or_else(|| AppError::ProjectNotFound {
+                    project_id: project_id.to_owned(),
+                })?;
+            let mut project_ids: Vec<_> = config.projects.keys().collect();
+            project_ids.sort_unstable();
+            config.project(project_ids[index])?
+        }
+    };
+    let project_id = selected_project.project_id.as_str();
     let project = database.project_state(project_id).await?;
-    let deployments = database.deployments_for_project(project_id).await?;
+    let mut deployments = database.deployments_for_project(project_id).await?;
+    deployments.reverse();
     emit_json(&StatusOutput {
         ok: true,
         project,

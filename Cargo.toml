@@ -1,6 +1,6 @@
 [package]
 name = "aynur-deploy"
-version = "0.5.2"
+version = "0.5.3"
 edition = "2024"
 description = "Strict Gitee Tag deployment service"
 repository = "https://github.com/menzil/aynur-deploy"
