@@ -74,13 +74,18 @@ impl Database {
         .fetch_one(&self.pool)
         .await?;
         match (schema_version, deployments_table_exists) {
-            (0, 0) => self.create_schema_v2().await?,
+            (0, 0) => self.create_schema_v3().await?,
             (0, 1) => {
                 self.migrate_schema_v0_to_v1().await?;
                 self.migrate_schema_v1_to_v2().await?;
+                self.migrate_schema_v2_to_v3().await?;
             }
-            (1, 1) => self.migrate_schema_v1_to_v2().await?,
-            (2, 1) => {}
+            (1, 1) => {
+                self.migrate_schema_v1_to_v2().await?;
+                self.migrate_schema_v2_to_v3().await?;
+            }
+            (2, 1) => self.migrate_schema_v2_to_v3().await?,
+            (3, 1) => {}
             (version, table_count) => {
                 return Err(AppError::InvalidState {
                     reason: format!(
@@ -93,12 +98,12 @@ impl Database {
         Ok(())
     }
 
-    async fn create_schema_v2(&self) -> Result<(), AppError> {
+    async fn create_schema_v3(&self) -> Result<(), AppError> {
         let statement = create_deployments_table_sql("deployments")?;
         sqlx::query(AssertSqlSafe(statement))
             .execute(&self.pool)
             .await?;
-        sqlx::query("PRAGMA user_version = 2")
+        sqlx::query("PRAGMA user_version = 3")
             .execute(&self.pool)
             .await?;
         Ok(())
@@ -147,6 +152,41 @@ impl Database {
         .execute(&mut *transaction)
         .await?;
         sqlx::query("PRAGMA user_version = 2")
+            .execute(&mut *transaction)
+            .await?;
+        transaction.commit().await?;
+        Ok(())
+    }
+
+    async fn migrate_schema_v2_to_v3(&self) -> Result<(), AppError> {
+        let mut transaction = self.pool.begin().await?;
+        let statement = create_deployments_table_sql("deployments_v3")?;
+        sqlx::query(AssertSqlSafe(statement))
+            .execute(&mut *transaction)
+            .await?;
+        sqlx::query(
+            r#"
+            INSERT INTO deployments_v3(
+                id, project_id, event_key, kind, tag, requested_sha, commit_sha,
+                release_path, previous_release_path, cache_refresh_task_ids, status,
+                error_code, error_message, retry_of, created_at, updated_at, completed_at
+            )
+            SELECT
+                id, project_id, event_key, kind, tag, requested_sha, commit_sha,
+                release_path, previous_release_path, NULL, status,
+                error_code, error_message, retry_of, created_at, updated_at, completed_at
+            FROM deployments
+            "#,
+        )
+        .execute(&mut *transaction)
+        .await?;
+        sqlx::query("DROP TABLE deployments")
+            .execute(&mut *transaction)
+            .await?;
+        sqlx::query("ALTER TABLE deployments_v3 RENAME TO deployments")
+            .execute(&mut *transaction)
+            .await?;
+        sqlx::query("PRAGMA user_version = 3")
             .execute(&mut *transaction)
             .await?;
         transaction.commit().await?;
@@ -371,7 +411,7 @@ impl Database {
                 JOIN project_state p ON p.project_id = d.project_id
                 WHERE d.status IN (
                     'queued', 'fetching', 'building', 'migrating', 'activating',
-                    'healthChecking', 'rollingBack'
+                    'healthChecking', 'refreshingCache', 'rollingBack'
                 ) AND p.stopped = 0 AND p.blocked = 0
                 ORDER BY d.created_at ASC, d.id ASC
                 LIMIT 1
@@ -407,7 +447,7 @@ impl Database {
             SELECT status FROM deployments
             WHERE project_id = ? AND status IN (
                 'queued', 'fetching', 'building', 'migrating', 'activating',
-                'healthChecking', 'rollingBack'
+                'healthChecking', 'refreshingCache', 'rollingBack'
             )
             ORDER BY created_at ASC, id ASC
             LIMIT 1
@@ -490,7 +530,7 @@ impl Database {
             SELECT * FROM deployments
             WHERE project_id = ? AND status IN (
                 'fetching', 'building', 'migrating', 'activating',
-                'healthChecking', 'rollingBack'
+                'healthChecking', 'refreshingCache', 'rollingBack'
             )
             ORDER BY created_at ASC, id ASC
             LIMIT 1
@@ -544,7 +584,7 @@ impl Database {
             SELECT * FROM deployments
             WHERE project_id = ? AND status IN (
                 'queued', 'fetching', 'building', 'migrating', 'activating',
-                'healthChecking', 'rollingBack'
+                'healthChecking', 'refreshingCache', 'rollingBack'
             )
             ORDER BY created_at ASC, id ASC
             LIMIT 1
@@ -664,6 +704,59 @@ impl Database {
                 "#,
             )
             .bind(path_string(previous_release_path)?)
+            .bind(now)
+            .bind(deployment_id)
+            .execute(&self.pool)
+            .await?
+            .rows_affected(),
+            deployment_id,
+        )
+    }
+
+    pub async fn set_cache_refresh_task_ids(
+        &self,
+        deployment_id: &str,
+        task_ids: &[String],
+    ) -> Result<(), AppError> {
+        if task_ids.is_empty() {
+            return Err(AppError::InvalidState {
+                reason: format!(
+                    "deployment {deployment_id} cache refresh task IDs must not be empty"
+                ),
+            });
+        }
+        let serialized = serde_json::to_string(task_ids).map_err(|source| {
+            AppError::InvalidState {
+                reason: format!(
+                    "deployment {deployment_id} cache refresh task IDs could not be serialized: {source}"
+                ),
+            }
+        })?;
+        let now = now();
+        update_exactly_one(
+            sqlx::query(
+                "UPDATE deployments SET cache_refresh_task_ids = ?, updated_at = ? WHERE id = ?",
+            )
+            .bind(serialized)
+            .bind(now)
+            .bind(deployment_id)
+            .execute(&self.pool)
+            .await?
+            .rows_affected(),
+            deployment_id,
+        )
+    }
+
+    pub async fn start_rollback(&self, deployment_id: &str) -> Result<(), AppError> {
+        let now = now();
+        update_exactly_one(
+            sqlx::query(
+                r#"
+                UPDATE deployments
+                SET status = 'rollingBack', cache_refresh_task_ids = NULL, updated_at = ?
+                WHERE id = ?
+                "#,
+            )
             .bind(now)
             .bind(deployment_id)
             .execute(&self.pool)
@@ -822,7 +915,10 @@ impl Database {
 }
 
 fn create_deployments_table_sql(table_name: &str) -> Result<String, AppError> {
-    if !matches!(table_name, "deployments" | "deployments_v1") {
+    if !matches!(
+        table_name,
+        "deployments" | "deployments_v1" | "deployments_v3"
+    ) {
         return Err(AppError::InvalidState {
             reason: format!("unsupported internal deployments table name {table_name:?}"),
         });
@@ -839,9 +935,11 @@ fn create_deployments_table_sql(table_name: &str) -> Result<String, AppError> {
             commit_sha TEXT,
             release_path TEXT,
             previous_release_path TEXT,
+            cache_refresh_task_ids TEXT,
             status TEXT NOT NULL CHECK (status IN (
                 'queued', 'fetching', 'building', 'migrating', 'activating',
-                'healthChecking', 'rollingBack', 'succeeded', 'failed', 'rollbackFailed'
+                'healthChecking', 'refreshingCache', 'rollingBack',
+                'succeeded', 'failed', 'rollbackFailed'
             )),
             error_code TEXT,
             error_message TEXT,

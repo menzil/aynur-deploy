@@ -107,7 +107,7 @@ async fn existing_v03_database_is_upgraded_without_losing_deployments() {
         .fetch_one(&verification_pool)
         .await
         .unwrap();
-    assert_eq!(version, 2);
+    assert_eq!(version, 3);
     let table_sql: String = sqlx::query_scalar(
         "SELECT sql FROM sqlite_master WHERE type = 'table' AND name = 'deployments'",
     )
@@ -115,6 +115,8 @@ async fn existing_v03_database_is_upgraded_without_losing_deployments() {
     .await
     .unwrap();
     assert!(table_sql.contains("'migrating'"));
+    assert!(table_sql.contains("'refreshingCache'"));
+    assert!(table_sql.contains("cache_refresh_task_ids"));
     let project_table_sql: String = sqlx::query_scalar(
         "SELECT sql FROM sqlite_master WHERE type = 'table' AND name = 'project_state'",
     )
@@ -210,5 +212,5 @@ async fn existing_v1_database_is_upgraded_without_clearing_blocked_state() {
         .fetch_one(&verification_pool)
         .await
         .unwrap();
-    assert_eq!(version, 2);
+    assert_eq!(version, 3);
 }

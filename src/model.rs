@@ -48,6 +48,7 @@ pub enum DeploymentStatus {
     Migrating,
     Activating,
     HealthChecking,
+    RefreshingCache,
     RollingBack,
     Succeeded,
     Failed,
@@ -70,6 +71,7 @@ impl Display for DeploymentStatus {
             Self::Migrating => "migrating",
             Self::Activating => "activating",
             Self::HealthChecking => "healthChecking",
+            Self::RefreshingCache => "refreshingCache",
             Self::RollingBack => "rollingBack",
             Self::Succeeded => "succeeded",
             Self::Failed => "failed",
@@ -89,6 +91,7 @@ impl FromStr for DeploymentStatus {
             "migrating" => Ok(Self::Migrating),
             "activating" => Ok(Self::Activating),
             "healthChecking" => Ok(Self::HealthChecking),
+            "refreshingCache" => Ok(Self::RefreshingCache),
             "rollingBack" => Ok(Self::RollingBack),
             "succeeded" => Ok(Self::Succeeded),
             "failed" => Ok(Self::Failed),
@@ -111,6 +114,7 @@ pub struct DeploymentRow {
     pub commit_sha: Option<String>,
     pub release_path: Option<String>,
     pub previous_release_path: Option<String>,
+    pub cache_refresh_task_ids: Option<String>,
     pub status: String,
     pub error_code: Option<String>,
     pub error_message: Option<String>,
@@ -132,6 +136,7 @@ pub struct Deployment {
     pub commit_sha: Option<String>,
     pub release_path: Option<PathBuf>,
     pub previous_release_path: Option<PathBuf>,
+    pub cache_refresh_task_ids: Vec<String>,
     pub status: DeploymentStatus,
     pub error_code: Option<String>,
     pub error_message: Option<String>,
@@ -158,6 +163,7 @@ impl TryFrom<DeploymentRow> for Deployment {
             commit_sha: row.commit_sha,
             release_path: row.release_path.map(PathBuf::from),
             previous_release_path: row.previous_release_path.map(PathBuf::from),
+            cache_refresh_task_ids: parse_task_ids(row.cache_refresh_task_ids)?,
             status: row.status.parse()?,
             error_code: row.error_code,
             error_message: row.error_message,
@@ -167,6 +173,26 @@ impl TryFrom<DeploymentRow> for Deployment {
             completed_at: row.completed_at,
         })
     }
+}
+
+fn parse_task_ids(value: Option<String>) -> Result<Vec<String>, AppError> {
+    let Some(value) = value else {
+        return Ok(Vec::new());
+    };
+    let values =
+        serde_json::from_str::<Vec<String>>(&value).map_err(|source| AppError::InvalidState {
+            reason: format!("stored cache refresh task IDs are invalid: {source}"),
+        })?;
+    if values.is_empty()
+        || values.iter().any(|task_id| {
+            task_id.is_empty() || !task_id.chars().all(|value| value.is_ascii_digit())
+        })
+    {
+        return Err(AppError::InvalidState {
+            reason: format!("stored cache refresh task IDs are invalid: {values:?}"),
+        });
+    }
+    Ok(values)
 }
 
 #[derive(Debug, Clone, FromRow)]

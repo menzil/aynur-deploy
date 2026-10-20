@@ -15,3 +15,14 @@ timeoutMs = 5000
 [deployment]
 type = "static"
 entryFile = "index.html"
+
+[cacheRefresh]
+type = "aliyun_cdn"
+profile = "orhan-blog-cdn"
+objectPath = "https://static.orhan.cn/"
+objectType = "Directory"
+force = true
+attempts = 3
+retryDelayMs = 2000
+pollIntervalMs = 5000
+timeoutMs = 600000

@@ -759,6 +759,7 @@ stateDirectory = "{}"
 projectsDirectory = "{}"
 gitCommand = "/usr/bin/git"
 cargoCommand = "/usr/bin/git"
+aliyunCommand = "/usr/bin/true"
 gitFetchAttempts = 2
 gitFetchRetryDelayMs = 1
 commandTimeoutSeconds = 30

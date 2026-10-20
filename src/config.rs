@@ -19,6 +19,7 @@ pub struct GlobalConfig {
     pub projects_directory: PathBuf,
     pub git_command: PathBuf,
     pub cargo_command: PathBuf,
+    pub aliyun_command: PathBuf,
     pub git_fetch_attempts: u32,
     pub git_fetch_retry_delay_ms: u64,
     pub command_timeout_seconds: u64,
@@ -40,6 +41,7 @@ struct ProjectConfig {
     deployment: DeploymentConfig,
     migration: Option<MigrationConfig>,
     reload: Option<ReloadConfig>,
+    cache_refresh: Option<CacheRefreshConfig>,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -92,6 +94,45 @@ struct ReloadConfig {
     commands: Vec<Vec<String>>,
 }
 
+#[derive(Debug, Clone, Deserialize)]
+#[serde(
+    tag = "type",
+    rename_all = "snake_case",
+    rename_all_fields = "camelCase",
+    deny_unknown_fields
+)]
+enum CacheRefreshConfig {
+    AliyunCdn {
+        profile: String,
+        object_path: String,
+        object_type: AliyunCdnObjectType,
+        force: bool,
+        attempts: u32,
+        retry_delay_ms: u64,
+        poll_interval_ms: u64,
+        timeout_ms: u64,
+    },
+}
+
+#[derive(Debug, Clone, Copy, Deserialize)]
+pub enum AliyunCdnObjectType {
+    Directory,
+}
+
+impl AliyunCdnObjectType {
+    pub fn as_api_value(self) -> &'static str {
+        match self {
+            Self::Directory => "Directory",
+        }
+    }
+
+    pub fn as_response_value(self) -> &'static str {
+        match self {
+            Self::Directory => "directory",
+        }
+    }
+}
+
 #[derive(Clone)]
 pub struct SecretString(String);
 
@@ -115,6 +156,24 @@ pub struct Project {
     pub deployment: DeploymentTarget,
     pub migration: Option<ConfiguredCommand>,
     pub reload: Vec<ConfiguredCommand>,
+    pub cache_refresh: Option<CacheRefresh>,
+}
+
+#[derive(Debug, Clone)]
+pub enum CacheRefresh {
+    AliyunCdn(AliyunCdnCacheRefresh),
+}
+
+#[derive(Debug, Clone)]
+pub struct AliyunCdnCacheRefresh {
+    pub profile: String,
+    pub object_path: String,
+    pub object_type: AliyunCdnObjectType,
+    pub force: bool,
+    pub attempts: u32,
+    pub retry_delay_ms: u64,
+    pub poll_interval_ms: u64,
+    pub timeout_ms: u64,
 }
 
 #[derive(Debug, Clone)]
@@ -224,6 +283,12 @@ pub fn load_config(path: &Path) -> Result<LoadedConfig, AppError> {
     {
         validate_executable(path, "cargoCommand", &global.cargo_command)?;
     }
+    if projects
+        .values()
+        .any(|project| project.cache_refresh.is_some())
+    {
+        validate_executable(path, "aliyunCommand", &global.aliyun_command)?;
+    }
     Ok(LoadedConfig { global, projects })
 }
 
@@ -242,6 +307,7 @@ fn validate_global(path: &Path, config: &GlobalConfig) -> Result<(), AppError> {
     validate_absolute_path(path, "projectsDirectory", &config.projects_directory)?;
     validate_executable(path, "gitCommand", &config.git_command)?;
     validate_absolute_path(path, "cargoCommand", &config.cargo_command)?;
+    validate_absolute_path(path, "aliyunCommand", &config.aliyun_command)?;
     validate_positive(
         path,
         "gitFetchAttempts",
@@ -325,6 +391,10 @@ fn load_project(path: &Path) -> Result<Project, AppError> {
         .map(|migration| load_command(path, "migration.command", migration.command))
         .transpose()?;
     let reload = load_reload(path, config.reload)?;
+    let cache_refresh = config
+        .cache_refresh
+        .map(|cache_refresh| load_cache_refresh(path, cache_refresh))
+        .transpose()?;
 
     Ok(Project {
         config_path: path.to_path_buf(),
@@ -339,7 +409,56 @@ fn load_project(path: &Path) -> Result<Project, AppError> {
         deployment,
         migration,
         reload,
+        cache_refresh,
     })
+}
+
+fn load_cache_refresh(path: &Path, config: CacheRefreshConfig) -> Result<CacheRefresh, AppError> {
+    match config {
+        CacheRefreshConfig::AliyunCdn {
+            profile,
+            object_path,
+            object_type,
+            force,
+            attempts,
+            retry_delay_ms,
+            poll_interval_ms,
+            timeout_ms,
+        } => {
+            validate_name(path, "cacheRefresh.profile", &profile)?;
+            let url = reqwest::Url::parse(&object_path).map_err(|source| AppError::Config {
+                path: path.to_path_buf(),
+                reason: format!("cacheRefresh.objectPath {object_path:?} is invalid: {source}"),
+            })?;
+            if url.scheme() != "https"
+                || url.host_str().is_none()
+                || url.path() != "/"
+                || url.query().is_some()
+                || url.fragment().is_some()
+            {
+                return Err(AppError::Config {
+                    path: path.to_path_buf(),
+                    reason: format!(
+                        "cacheRefresh.objectPath must be an HTTPS origin root ending in / without query or fragment, got {object_path:?}"
+                    ),
+                });
+            }
+            validate_positive(path, "cacheRefresh.attempts", u64::from(attempts))?;
+            validate_positive(path, "cacheRefresh.retryDelayMs", retry_delay_ms)?;
+            validate_positive(path, "cacheRefresh.pollIntervalMs", poll_interval_ms)?;
+            validate_positive(path, "cacheRefresh.timeoutMs", timeout_ms)?;
+            Ok(CacheRefresh::AliyunCdn(AliyunCdnCacheRefresh {
+                profile,
+                object_path: url.to_string(),
+                object_type,
+                force,
+                attempts,
+                retry_delay_ms,
+                poll_interval_ms,
+                timeout_ms,
+            }))
+        }
+    }
 }
 
 fn validate_current_path(path: &Path, value: &Path) -> Result<(), AppError> {

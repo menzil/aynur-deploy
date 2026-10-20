@@ -41,7 +41,9 @@ enum Command {
     Add(AddArgs),
     #[command(about = "List configured deployment projects")]
     List,
-    #[command(about = "Show deployment status by project name or list index (names take precedence)")]
+    #[command(
+        about = "Show deployment status by project name or list index (names take precedence)"
+    )]
     Status(ProjectArgs),
     #[command(about = "Stop accepting and processing deployments for a project")]
     Stop(ProjectArgs),
@@ -161,7 +163,6 @@ struct ListedProject {
     current_path: PathBuf,
     status: String,
 }
-
 
 #[derive(Debug, Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -611,7 +612,7 @@ fn format_global_config(home: &Path) -> String {
         home.join("state")
     };
     format!(
-        "listenAddress = \"127.0.0.1:9091\"\ndatabasePath = \"{}\"\nstateDirectory = \"{}\"\nprojectsDirectory = \"{}\"\ngitCommand = \"/usr/bin/git\"\ncargoCommand = \"/usr/bin/cargo\"\ngitFetchAttempts = 3\ngitFetchRetryDelayMs = 2000\ncommandTimeoutSeconds = 1800\nmaxWebhookBodyBytes = 65536\nworkerPollIntervalMs = 1000\n",
+        "listenAddress = \"127.0.0.1:9091\"\ndatabasePath = \"{}\"\nstateDirectory = \"{}\"\nprojectsDirectory = \"{}\"\ngitCommand = \"/usr/bin/git\"\ncargoCommand = \"/usr/bin/cargo\"\naliyunCommand = \"/usr/local/bin/aliyun\"\ngitFetchAttempts = 3\ngitFetchRetryDelayMs = 2000\ncommandTimeoutSeconds = 1800\nmaxWebhookBodyBytes = 65536\nworkerPollIntervalMs = 1000\n",
         state_directory.join("deployments.sqlite3").display(),
         state_directory.display(),
         home.join("projects").display(),

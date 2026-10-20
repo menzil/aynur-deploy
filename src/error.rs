@@ -42,6 +42,11 @@ pub enum AppError {
     },
     #[error("HTTP health check for {url} failed: {reason}")]
     HealthCheck { url: String, reason: String },
+    #[error("CDN cache refresh operation {operation} failed: {reason}")]
+    CacheRefresh {
+        operation: &'static str,
+        reason: String,
+    },
     #[error("request validation failed: {reason}")]
     RequestValidation { reason: String },
     #[error("request body is too large: {reason}")]
@@ -94,6 +99,7 @@ impl AppError {
             Self::CommandFailed { .. } => "commandFailed",
             Self::CommandTimedOut { .. } => "commandTimedOut",
             Self::HealthCheck { .. } => "healthCheckFailed",
+            Self::CacheRefresh { .. } => "cacheRefreshFailed",
             Self::RequestValidation { .. } => "requestInvalid",
             Self::RequestTooLarge { .. } => "requestTooLarge",
             Self::Authentication { .. } => "authenticationFailed",
@@ -131,6 +137,7 @@ impl AppError {
             | Self::CommandFailed { .. }
             | Self::CommandTimedOut { .. }
             | Self::HealthCheck { .. }
+            | Self::CacheRefresh { .. }
             | Self::TaskJoin { .. } => StatusCode::INTERNAL_SERVER_ERROR,
         }
     }

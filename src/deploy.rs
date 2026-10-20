@@ -10,6 +10,7 @@ use tokio::sync::{Notify, watch};
 use tracing::{error, info, warn};
 use walkdir::WalkDir;
 
+use crate::cache_refresh::{submit_cache_refresh, wait_for_cache_refresh};
 use crate::config::{
     ConfiguredCommand, DeploymentTarget, LoadedConfig, Project, RustBinary, load_environment_file,
 };
@@ -115,7 +116,9 @@ impl Deployer {
                     .await?;
                 self.activate(project, deployment, release_path).await
             }
-            DeploymentStatus::Activating | DeploymentStatus::HealthChecking => {
+            DeploymentStatus::Activating
+            | DeploymentStatus::HealthChecking
+            | DeploymentStatus::RefreshingCache => {
                 self.recover_after_activation(
                     project,
                     deployment,
@@ -160,7 +163,9 @@ impl Deployer {
                     .mark_failed(&deployment.id, source.code(), &source.to_string())
                     .await
             }
-            DeploymentStatus::Activating | DeploymentStatus::HealthChecking => {
+            DeploymentStatus::Activating
+            | DeploymentStatus::HealthChecking
+            | DeploymentStatus::RefreshingCache => {
                 let project = self.config.project(&deployment.project_id)?;
                 self.recover_after_activation(project, &deployment, &source.to_string())
                     .await
@@ -658,16 +663,11 @@ impl Deployer {
                 .rollback_after_activation(project, deployment, previous.as_deref(), &source)
                 .await;
         }
-        self.database.mark_succeeded(&deployment.id).await?;
-        self.cleanup_retention(project).await?;
-        info!(
-            projectId = %deployment.project_id,
-            deploymentId = %deployment.id,
-            tag = %deployment.tag,
-            commitSha = deployment.commit_sha.as_deref().unwrap_or(&deployment.requested_sha),
-            stage = "succeeded",
-            "deployment succeeded"
-        );
+        if let Err(source) = self.complete_activation(project, deployment).await {
+            return self
+                .rollback_after_activation(project, deployment, previous.as_deref(), &source)
+                .await;
+        }
         Ok(())
     }
 
@@ -704,11 +704,19 @@ impl Deployer {
                 .set_status(&deployment.id, DeploymentStatus::HealthChecking)
                 .await?;
             match self.health_check(project, deployment).await {
-                Ok(()) => {
-                    self.database.mark_succeeded(&deployment.id).await?;
-                    self.cleanup_retention(project).await?;
-                    return Ok(());
-                }
+                Ok(()) => match self.complete_activation(project, deployment).await {
+                    Ok(()) => return Ok(()),
+                    Err(source) => {
+                        return self
+                            .rollback_after_activation(
+                                project,
+                                deployment,
+                                deployment.previous_release_path.as_deref(),
+                                &source,
+                            )
+                            .await;
+                    }
+                },
                 Err(source) => {
                     return self
                         .rollback_after_activation(
@@ -751,9 +759,7 @@ impl Deployer {
         previous: Option<&Path>,
         original_error: &AppError,
     ) -> Result<(), AppError> {
-        self.database
-            .set_status(&deployment.id, DeploymentStatus::RollingBack)
-            .await?;
+        self.database.start_rollback(&deployment.id).await?;
         let Some(previous_path) = previous else {
             let reason = format!(
                 "deployment failed with {original_error}; no previous release exists for rollback"
@@ -766,7 +772,9 @@ impl Deployer {
             validate_release(project, previous_path)?;
             switch_current(&self.current_path(project), previous_path, &deployment.id)?;
             self.reload_if_required(project, deployment).await?;
-            self.health_check(project, deployment).await
+            self.health_check(project, deployment).await?;
+            let current = self.database.get_deployment(&deployment.id).await?;
+            self.refresh_cache(project, &current).await
         }
         .await;
         match rollback_result {
@@ -814,7 +822,8 @@ impl Deployer {
                 switch_current(&self.current_path(project), previous_path, &deployment.id)?;
             }
             self.reload_if_required(project, deployment).await?;
-            self.health_check(project, deployment).await
+            self.health_check(project, deployment).await?;
+            self.refresh_cache(project, deployment).await
         }
         .await;
         match recovery {
@@ -859,6 +868,72 @@ impl Deployer {
             "rollback failed and project was blocked"
         );
         Ok(())
+    }
+
+    async fn complete_activation(
+        &self,
+        project: &Project,
+        deployment: &Deployment,
+    ) -> Result<(), AppError> {
+        self.refresh_cache_after_activation(project, deployment)
+            .await?;
+        self.database.mark_succeeded(&deployment.id).await?;
+        self.cleanup_retention(project).await?;
+        info!(
+            projectId = %deployment.project_id,
+            deploymentId = %deployment.id,
+            tag = %deployment.tag,
+            commitSha = deployment.commit_sha.as_deref().unwrap_or(&deployment.requested_sha),
+            stage = "succeeded",
+            "deployment succeeded"
+        );
+        Ok(())
+    }
+
+    async fn refresh_cache_after_activation(
+        &self,
+        project: &Project,
+        deployment: &Deployment,
+    ) -> Result<(), AppError> {
+        if project.cache_refresh.is_none() {
+            return Ok(());
+        }
+        self.database
+            .set_status(&deployment.id, DeploymentStatus::RefreshingCache)
+            .await?;
+        let current = self.database.get_deployment(&deployment.id).await?;
+        self.refresh_cache(project, &current).await
+    }
+
+    async fn refresh_cache(
+        &self,
+        project: &Project,
+        deployment: &Deployment,
+    ) -> Result<(), AppError> {
+        let Some(cache_refresh) = &project.cache_refresh else {
+            return Ok(());
+        };
+        let task_ids = if deployment.cache_refresh_task_ids.is_empty() {
+            let task_ids = submit_cache_refresh(
+                &self.config.global.aliyun_command,
+                self.config.global.command_timeout_seconds,
+                cache_refresh,
+            )
+            .await?;
+            self.database
+                .set_cache_refresh_task_ids(&deployment.id, &task_ids)
+                .await?;
+            task_ids
+        } else {
+            deployment.cache_refresh_task_ids.clone()
+        };
+        wait_for_cache_refresh(
+            &self.config.global.aliyun_command,
+            self.config.global.command_timeout_seconds,
+            cache_refresh,
+            &task_ids,
+        )
+        .await
     }
 
     async fn reload_if_required(

@@ -119,6 +119,27 @@ commands = [
 ]
 ```
 
+静态站点需要在切换和健康检查完成后刷新阿里云 CDN 时，先在全局配置中填写官方 CLI 的绝对路径，再给项目添加严格的刷新配置：
+
+```toml
+aliyunCommand = "/usr/local/bin/aliyun"
+
+[cacheRefresh]
+type = "aliyun_cdn"
+profile = "orhan-blog-cdn"
+objectPath = "https://static.orhan.cn/"
+objectType = "Directory"
+force = true
+attempts = 3
+retryDelayMs = 2000
+pollIntervalMs = 5000
+timeoutMs = 600000
+```
+
+`aynur-deploy` 使用配置的 EcsRamRole profile 调用 `RefreshObjectCaches`，保存返回的任务 ID，并通过 `DescribeRefreshTasks` 等待所有任务完成。刷新失败会触发 release 回滚；回滚完成后会再次刷新 CDN，使恢复后的 HTML 和静态资源保持一致。服务重启时会继续查询已保存的任务，不会无条件重复提交。实例角色只需授予 `cdn:RefreshObjectCaches` 和 `cdn:DescribeRefreshTasks`。
+
+`profile` 属于项目配置，不是全局默认值。同一台服务器上的不同项目可以显式选择不同的阿里云 CLI profile；跨账号场景应为各项目配置独立的 `RamRoleArn` profile，由实例角色扮演目标账号中的最小权限角色。项目 TOML 不保存 AccessKey，也不会回退到 CLI 的默认 profile。
+
 把 `webhookToken` 填入 Gitee 仓库的 Tag Push WebHook Password，URL 指向反向代理后的 `/v1/hooks/gitee/orhan-blog`。Token 不会写入日志；项目 TOML 必须保持 `0600`。
 
 ## Nginx 反向代理
