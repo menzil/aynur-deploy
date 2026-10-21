@@ -19,7 +19,7 @@ pub struct GlobalConfig {
     pub projects_directory: PathBuf,
     pub git_command: PathBuf,
     pub cargo_command: PathBuf,
-    pub aliyun_command: PathBuf,
+    pub aliyun_command: Option<PathBuf>,
     pub git_fetch_attempts: u32,
     pub git_fetch_retry_delay_ms: u64,
     pub command_timeout_seconds: u64,
@@ -287,7 +287,15 @@ pub fn load_config(path: &Path) -> Result<LoadedConfig, AppError> {
         .values()
         .any(|project| project.cache_refresh.is_some())
     {
-        validate_executable(path, "aliyunCommand", &global.aliyun_command)?;
+        let aliyun_command = global
+            .aliyun_command
+            .as_deref()
+            .ok_or_else(|| AppError::Config {
+                path: path.to_path_buf(),
+                reason: "aliyunCommand is required when a project configures cacheRefresh"
+                    .to_owned(),
+            })?;
+        validate_executable(path, "aliyunCommand", aliyun_command)?;
     }
     Ok(LoadedConfig { global, projects })
 }
@@ -307,7 +315,9 @@ fn validate_global(path: &Path, config: &GlobalConfig) -> Result<(), AppError> {
     validate_absolute_path(path, "projectsDirectory", &config.projects_directory)?;
     validate_executable(path, "gitCommand", &config.git_command)?;
     validate_absolute_path(path, "cargoCommand", &config.cargo_command)?;
-    validate_absolute_path(path, "aliyunCommand", &config.aliyun_command)?;
+    if let Some(aliyun_command) = &config.aliyun_command {
+        validate_absolute_path(path, "aliyunCommand", aliyun_command)?;
+    }
     validate_positive(
         path,
         "gitFetchAttempts",

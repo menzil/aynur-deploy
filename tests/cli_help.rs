@@ -3,6 +3,7 @@ use std::os::unix::fs::PermissionsExt;
 use std::path::PathBuf;
 use std::process::Command;
 
+use aynur_deploy::config::load_config;
 use aynur_deploy::db::Database;
 use aynur_deploy::model::DeploymentStatus;
 use serde_json::Value;
@@ -62,6 +63,9 @@ async fn init_creates_private_project_config_with_generated_token() {
         .expect("init command must start");
     assert!(output.status.success(), "stderr={:?}", output.stderr);
     assert!(String::from_utf8_lossy(&output.stdout).starts_with("{\n  \"ok\": true,\n"));
+    let initialized = load_config(&directory.path().join("config.toml"))
+        .expect("initialized config must load without CDN dependencies");
+    assert!(initialized.global.aliyun_command.is_none());
 
     let empty_list = Command::new(env!("CARGO_BIN_EXE_aynur-deploy"))
         .arg("list")
@@ -324,6 +328,129 @@ async fn init_creates_private_project_config_with_generated_token() {
         String::from_utf8_lossy(&relative.stderr)
             .contains("currentPath must be a normalized absolute path other than /")
     );
+}
+
+#[test]
+fn v053_config_requires_aliyun_command_only_for_cache_refresh() {
+    let directory = tempdir().expect("temporary home must be created");
+    let xdg_config_home = directory.path().join("xdg");
+    let init = Command::new(env!("CARGO_BIN_EXE_aynur-deploy"))
+        .args(["init", "--home"])
+        .arg(directory.path())
+        .env("XDG_CONFIG_HOME", &xdg_config_home)
+        .output()
+        .expect("init command must start");
+    assert!(init.status.success(), "stderr={:?}", init.stderr);
+
+    let config_path = directory.path().join("config.toml");
+    let v053_config = format!(
+        r#"listenAddress = "127.0.0.1:9091"
+databasePath = "{home}/state/deployments.sqlite3"
+stateDirectory = "{home}/state"
+projectsDirectory = "{home}/projects"
+gitCommand = "/usr/bin/git"
+cargoCommand = "/usr/bin/cargo"
+gitFetchAttempts = 3
+gitFetchRetryDelayMs = 2000
+commandTimeoutSeconds = 1800
+maxWebhookBodyBytes = 65536
+workerPollIntervalMs = 1000
+"#,
+        home = directory.path().display(),
+    );
+    fs::write(&config_path, &v053_config).expect("v0.5.3 config must be written");
+
+    for args in [
+        &["list"][..],
+        &["init"],
+        &["add", "legacy-site"],
+        &["check"],
+        &["status", "legacy-site"],
+        &["list"],
+    ] {
+        let output = Command::new(env!("CARGO_BIN_EXE_aynur-deploy"))
+            .args(args)
+            .env("XDG_CONFIG_HOME", &xdg_config_home)
+            .output()
+            .expect("command must start with v0.5.3 config");
+        assert!(
+            output.status.success(),
+            "args={args:?}, stderr={:?}",
+            output.stderr
+        );
+        let json: Value = serde_json::from_slice(&output.stdout).unwrap();
+        assert_eq!(json["ok"], true);
+    }
+    assert_eq!(fs::read_to_string(&config_path).unwrap(), v053_config);
+
+    let project_path = directory.path().join("projects/legacy-site.toml");
+    let project = fs::read_to_string(&project_path).expect("project config must exist");
+    fs::write(
+        &project_path,
+        format!(
+            "{project}\n[cacheRefresh]\ntype = \"aliyun_cdn\"\nprofile = \"test-cdn\"\nobjectPath = \"https://static.example.com/\"\nobjectType = \"Directory\"\nforce = true\nattempts = 3\nretryDelayMs = 2000\npollIntervalMs = 5000\ntimeoutMs = 600000\n"
+        ),
+    )
+    .expect("CDN cache refresh config must be written");
+
+    let missing_command = Command::new(env!("CARGO_BIN_EXE_aynur-deploy"))
+        .arg("check")
+        .env("XDG_CONFIG_HOME", &xdg_config_home)
+        .output()
+        .expect("check command must start");
+    assert!(!missing_command.status.success());
+    let error: Value = serde_json::from_slice(&missing_command.stderr).unwrap();
+    assert_eq!(error["error"]["code"], "configInvalid");
+    assert!(
+        error["error"]["message"]
+            .as_str()
+            .unwrap()
+            .contains("aliyunCommand is required when a project configures cacheRefresh")
+    );
+
+    for (command_value, expected_error) in [
+        (
+            "\"aliyun\"".to_owned(),
+            "aliyunCommand must be an absolute path",
+        ),
+        (
+            format!("\"{}\"", config_path.display()),
+            "must be an executable file",
+        ),
+        ("42".to_owned(), "invalid type"),
+    ] {
+        fs::write(
+            &config_path,
+            format!("{v053_config}aliyunCommand = {command_value}\n"),
+        )
+        .unwrap();
+        let output = Command::new(env!("CARGO_BIN_EXE_aynur-deploy"))
+            .arg("check")
+            .env("XDG_CONFIG_HOME", &xdg_config_home)
+            .output()
+            .expect("check command must start");
+        assert!(!output.status.success());
+        let error: Value = serde_json::from_slice(&output.stderr).unwrap();
+        assert_eq!(error["error"]["code"], "configInvalid");
+        assert!(
+            error["error"]["message"]
+                .as_str()
+                .unwrap()
+                .contains(expected_error)
+        );
+    }
+
+    fs::write(
+        &config_path,
+        format!("{v053_config}aliyunCommand = \"/usr/bin/true\"\n"),
+    )
+    .unwrap();
+    let check = Command::new(env!("CARGO_BIN_EXE_aynur-deploy"))
+        .arg("check")
+        .env("XDG_CONFIG_HOME", &xdg_config_home)
+        .output()
+        .expect("check command must start");
+    assert!(check.status.success(), "stderr={:?}", check.stderr);
 }
 
 #[test]

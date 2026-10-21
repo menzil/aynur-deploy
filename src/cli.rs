@@ -612,7 +612,7 @@ fn format_global_config(home: &Path) -> String {
         home.join("state")
     };
     format!(
-        "listenAddress = \"127.0.0.1:9091\"\ndatabasePath = \"{}\"\nstateDirectory = \"{}\"\nprojectsDirectory = \"{}\"\ngitCommand = \"/usr/bin/git\"\ncargoCommand = \"/usr/bin/cargo\"\naliyunCommand = \"/usr/local/bin/aliyun\"\ngitFetchAttempts = 3\ngitFetchRetryDelayMs = 2000\ncommandTimeoutSeconds = 1800\nmaxWebhookBodyBytes = 65536\nworkerPollIntervalMs = 1000\n",
+        "listenAddress = \"127.0.0.1:9091\"\ndatabasePath = \"{}\"\nstateDirectory = \"{}\"\nprojectsDirectory = \"{}\"\ngitCommand = \"/usr/bin/git\"\ncargoCommand = \"/usr/bin/cargo\"\ngitFetchAttempts = 3\ngitFetchRetryDelayMs = 2000\ncommandTimeoutSeconds = 1800\nmaxWebhookBodyBytes = 65536\nworkerPollIntervalMs = 1000\n",
         state_directory.join("deployments.sqlite3").display(),
         state_directory.display(),
         home.join("projects").display(),

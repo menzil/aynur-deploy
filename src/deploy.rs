@@ -913,9 +913,20 @@ impl Deployer {
         let Some(cache_refresh) = &project.cache_refresh else {
             return Ok(());
         };
+        let aliyun_command = self
+            .config
+            .global
+            .aliyun_command
+            .as_deref()
+            .ok_or_else(|| AppError::InvalidState {
+                reason: format!(
+                    "project {:?} configures cacheRefresh but global aliyunCommand is missing",
+                    project.project_id
+                ),
+            })?;
         let task_ids = if deployment.cache_refresh_task_ids.is_empty() {
             let task_ids = submit_cache_refresh(
-                &self.config.global.aliyun_command,
+                aliyun_command,
                 self.config.global.command_timeout_seconds,
                 cache_refresh,
             )
@@ -928,7 +939,7 @@ impl Deployer {
             deployment.cache_refresh_task_ids.clone()
         };
         wait_for_cache_refresh(
-            &self.config.global.aliyun_command,
+            aliyun_command,
             self.config.global.command_timeout_seconds,
             cache_refresh,
             &task_ids,
